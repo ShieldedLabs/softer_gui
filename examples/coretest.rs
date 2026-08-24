@@ -5,6 +5,7 @@ fn main() {
     c.key_press_sym(35, 0x77, "w", 1_000_000);
     c.key(35, false);
     let mut n = 0;
-    while let Some(e) = c.next_event() { n += 1; println!("{:?}", e.kind); }
+    let mut e = Event::default();
+    while c.next_event(&mut e) { n += 1; println!("kind {} text {:?}", e.kind, e.text()); }
     println!("{n} events");
 }

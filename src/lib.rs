@@ -3,14 +3,20 @@
 //! fulcra/unix_future_gui.lbc; platform layers speak the X11/Wayland wire
 //! protocols directly so the binary links statically. Zero dependencies.
 //!
-//!   let mut gui = Gui::open("title", 800, 600)?;
+//! Plain polling, no callbacks:
+//!
+//!   let mut gui = softer_gui::open("title", "com.example.app", 800, 600).unwrap();
+//!   let mut ev = Event::default();
 //!   loop {
 //!       gui.wait();
-//!       while let Some(ev) = gui.next_event() {
+//!       while gui.next_event(&mut ev) {
 //!           match ev.kind {
-//!               Kind::Render(r) => if let Some(fb) = gui.get_framebuffer() { draw(&fb); gui.submit(); },
-//!               Kind::Close => return,
-//!               _ => apply_input(ev),
+//!               EVENT_RENDER => {
+//!                   let fb = gui.get_framebuffer();          // fb.pixels is null on backpressure: skip the frame
+//!                   if !fb.pixels.is_null() { draw(&fb); gui.submit(); }
+//!               }
+//!               EVENT_CLOSE => return,
+//!               _ => apply_input(&ev),
 //!           }
 //!       }
 //!   }
@@ -19,12 +25,18 @@
 //! window-sized top-left sub-rect with stride = side. `key` is stable per buffer
 //! in steady state and changes for both on any realloc, so a renderer can cache
 //! "what I drew per key" and patch only the diff.
+//!
+//! On macOS call `open` from the main thread: the library keeps that thread for
+//! AppKit and hands the caller's stack to a new thread, which is what returns
+//! from `open`. Nothing else differs.
 #![allow(clippy::missing_safety_doc)]
 
 pub mod event;
 pub mod keysym;
 mod keysym_table;
 pub mod xkb;
+pub mod icon;
+pub mod install;
 #[cfg(target_os = "linux")]
 pub mod sys;
 #[cfg(target_os = "linux")]
@@ -40,10 +52,10 @@ mod mac;
 
 pub use event::*;
 use std::sync::Arc;
+use std::sync::atomic::Ordering::*;
 
 /// Smallest power of two ≥ n (and ≥ 256): the square framebuffer's side.
 pub fn next_pow2(n: u32) -> u32 { let mut s = 256u32; while s < n { s <<= 1; } s }
-use std::sync::atomic::Ordering::*;
 
 enum Backend {
     #[cfg(target_os = "linux")]
@@ -60,55 +72,74 @@ pub struct Gui {
 }
 
 /// A back buffer to draw into. Pixels are 0xAARRGGBB with alpha 0xFF; stride is `side`.
-pub struct Framebuffer<'a> {
-    pub pixels: &'a mut [u32],
+/// `pixels` is null when no buffer is free (both still held by the display server).
+#[derive(Clone, Copy, Debug)]
+pub struct Framebuffer {
+    pub pixels: *mut u32,
     pub side: usize,
     pub width: usize,
     pub height: usize,
-    /// (generation << 1) | buffer index. Same key = same memory with the contents you last drew into it.
+    /// (generation << 1) | buffer index. Same key = same memory with what you last drew into it.
     pub key: u64,
 }
+impl Framebuffer {
+    pub fn ok(&self) -> bool { !self.pixels.is_null() }
+    /// The whole side*side buffer as a slice.
+    pub fn slice(&mut self) -> &mut [u32] { if self.pixels.is_null() { &mut [] } else { unsafe { core::slice::from_raw_parts_mut(self.pixels, self.side * self.side) } } }
+}
 
-impl Gui {
-    /// Open a window. Wayland first, X11 fallback (SOFTER_GUI_X11=1 forces X11).
-    /// Linux only: on macOS the main thread must pump AppKit, so use [`run`].
+/// Open a window. `app_id` names the application for the desktop (WM_CLASS / xdg app_id,
+/// e.g. "com.example.app"; see `install`). Linux: Wayland first, X11 fallback
+/// (SOFTER_GUI_X11=1 forces X11). macOS: main thread only.
+pub fn open(title: &str, app_id: &str, width: u32, height: u32) -> Option<Gui> {
+    let core = Arc::new(Core::new());
     #[cfg(target_os = "linux")]
-    pub fn open(title: &str, width: u32, height: u32) -> Option<Gui> {
-        let core = Arc::new(Core::new());
+    {
         let force_x11 = std::env::var("SOFTER_GUI_X11").map(|v| v == "1").unwrap_or(false);
         if !force_x11 {
-            if let Some(app) = wayland::open(core.clone(), title, width, height) {
+            if let Some(app) = wayland::open(core.clone(), title, app_id, width, height) {
                 return Some(Gui { core, back: Backend::Wayland(app) });
             }
         }
-        let app = x11::open(core.clone(), title, width, height)?;
+        let app = x11::open(core.clone(), title, app_id, width, height)?;
         Some(Gui { core, back: Backend::X11(app) })
     }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app_id;
+        let (app, pump) = mac::open(core.clone(), title, width, height)?;
+        // From here on we are a different kernel thread: the main thread now belongs to AppKit.
+        if !mac::takeover_main_thread(pump) { return None; }
+        Some(Gui { core, back: Backend::Mac(app) })
+    }
+}
 
-    /// Pop the next event, or None when the ring is empty.
-    pub fn next_event(&self) -> Option<Event> { self.core.next_event() }
+impl Gui {
+    /// Copy the next event into `ev`; false when there is none.
+    pub fn next_event(&mut self, ev: &mut Event) -> bool { self.core.next_event(ev) }
+
     /// Sleep until an event arrives.
-    pub fn wait(&self) { self.core.wait(0) }
-    /// Sleep until an event arrives or `ms` elapse.
-    pub fn wait_ms(&self, ms: u64) { self.core.wait(ms * 1_000_000) }
+    pub fn wait(&mut self) { self.wait_ms(0) }
+    /// Sleep until an event arrives or `ms` elapse (0 = no limit).
+    pub fn wait_ms(&mut self, ms: u64) { self.core.wait(ms * 1_000_000) }
 
-    /// Settle any pending resize and hand out the free back buffer. None means both
-    /// buffers are still held by the display server — skip this frame; a fresh
-    /// RENDER arrives when one is released.
-    pub fn get_framebuffer(&mut self) -> Option<Framebuffer<'_>> {
-        let (ptr, side, key) = match &mut self.back {
+    /// Settle any pending resize and hand out the free back buffer. `pixels` is null
+    /// when both buffers are still held by the display server — skip this frame; a
+    /// fresh RENDER arrives when one is released.
+    pub fn get_framebuffer(&mut self) -> Framebuffer {
+        let got = match &mut self.back {
             #[cfg(target_os = "linux")]
-            Backend::X11(a) => a.get_framebuffer()?,
+            Backend::X11(a) => a.get_framebuffer(),
             #[cfg(target_os = "linux")]
-            Backend::Wayland(a) => a.get_framebuffer()?,
+            Backend::Wayland(a) => a.get_framebuffer(),
             #[cfg(target_os = "macos")]
-            Backend::Mac(a) => a.get_framebuffer()?,
+            Backend::Mac(a) => a.get_framebuffer(),
         };
+        let Some((ptr, side, key)) = got else { return Framebuffer { pixels: core::ptr::null_mut(), side: 0, width: 0, height: 0, key: 0 } };
         let side = side as usize;
-        let pixels = unsafe { core::slice::from_raw_parts_mut(ptr, side * side) };
         let w = (self.core.win_w.load(Relaxed) as usize).min(side);
         let h = (self.core.win_h.load(Relaxed) as usize).min(side);
-        Some(Framebuffer { pixels, side, width: w, height: h, key })
+        Framebuffer { pixels: ptr, side, width: w, height: h, key }
     }
     /// Flip the buffer from the last get_framebuffer onto the screen at the next vblank.
     pub fn submit(&mut self) {
@@ -123,47 +154,25 @@ impl Gui {
     }
 
     /// Ask for a RENDER even though nothing was submitted last frame (animation wake-up).
-    pub fn request_frame(&self) { self.core.wants_frame.store(true, Relaxed); self.poke(); }
-    pub fn set_cursor_hidden(&self, hidden: bool) { self.core.cursor_hidden.store(hidden, Relaxed); self.poke(); }
-    pub fn set_fullscreen(&self, on: bool) { self.core.wants_fullscreen.store(on, Relaxed); self.poke(); }
+    pub fn request_frame(&mut self) { self.core.wants_frame.store(true, Relaxed); self.poke(); }
+    pub fn set_cursor_hidden(&mut self, hidden: bool) { self.core.cursor_hidden.store(hidden, Relaxed); self.poke(); }
+    pub fn set_fullscreen(&mut self, on: bool) { self.core.wants_fullscreen.store(on, Relaxed); self.poke(); }
     pub fn is_fullscreen(&self) -> bool { self.core.wants_fullscreen.load(Relaxed) }
     pub fn window_size(&self) -> (u32, u32) { (self.core.win_w.load(Relaxed), self.core.win_h.load(Relaxed)) }
-    /// The pump sets this when the window's contents must be fully redrawn (resize/realloc).
-    pub fn take_full_redraw(&self) -> bool { self.core.full_redraw.swap(false, AcqRel) }
+    /// Set by the pump when the window's contents must be fully redrawn (resize/realloc); cleared on read.
+    pub fn take_full_redraw(&mut self) -> bool { self.core.full_redraw.swap(false, AcqRel) }
+    /// Set the window icon: square 0xAARRGGBB images, any sizes (largest is preferred by the desktop).
+    pub fn set_icon(&mut self, images: &[icon::IconImage]) { self.core.set_icon(icon::own_set(images)); self.poke(); }
+    /// Nominal frame period, femtoseconds.
     pub fn period_fs(&self) -> u64 { self.core.period_fs() }
 
-    fn poke(&self) {
+    fn poke(&mut self) {
         match &self.back {
             #[cfg(target_os = "linux")]
             Backend::Wayland(a) => a.poke(),
             #[allow(unreachable_patterns)]
             _ => {}
         }
-    }
-}
-
-/// Open a window and run `app` against it. On Linux this is `app(Gui::open(..))` on the
-/// calling thread. On macOS the calling thread must be the main thread: it becomes the
-/// AppKit event pump and `app` runs on a second thread. Returns when `app` returns (or
-/// the window closes, on macOS).
-pub fn run<F: FnOnce(Gui) + Send + 'static>(title: &str, width: u32, height: u32, app: F) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        match Gui::open(title, width, height) { Some(g) => { app(g); true } None => false }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let core = Arc::new(Core::new());
-        let Some((a, mut pump)) = mac::open(core.clone(), title, width, height) else { return false };
-        let gui = Gui { core: core.clone(), back: Backend::Mac(a) };
-        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let done2 = done.clone();
-        std::thread::Builder::new().name("softer_gui-app".into()).spawn(move || { app(gui); done2.store(true, Release); }).expect("thread");
-        while !done.load(Acquire) && !core.quit.load(Relaxed) {
-            pump.pump_once();
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        true
     }
 }
 

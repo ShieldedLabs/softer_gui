@@ -100,6 +100,10 @@ fn ret_u64(r: id, s: SEL) -> u64 { send0(r, s) as u64 }
 fn ret_rect(r: id, s: SEL) -> NSRect { let f: extern "C" fn(id, SEL) -> NSRect = unsafe { core::mem::transmute(objc_msgSend as *const ()) }; f(r, s) }
 fn ret_point(r: id, s: SEL) -> NSPoint { let f: extern "C" fn(id, SEL) -> NSPoint = unsafe { core::mem::transmute(objc_msgSend as *const ()) }; f(r, s) }
 fn send_rect(r: id, s: SEL, rect: NSRect) -> id { let f: extern "C" fn(id, SEL, NSRect) -> id = unsafe { core::mem::transmute(objc_msgSend as *const ()) }; f(r, s, rect) }
+fn nsdata(bytes: &[u8]) -> id {
+    let f: extern "C" fn(id, SEL, *const u8, u64) -> id = unsafe { core::mem::transmute(objc_msgSend as *const ()) };
+    f(cls("NSData"), sel("dataWithBytes:length:"), bytes.as_ptr(), bytes.len() as u64)
+}
 fn nsstring(s: &str) -> id { let c = format!("{s}\0"); let f: extern "C" fn(id, SEL, *const u8) -> id = unsafe { core::mem::transmute(objc_msgSend as *const ()) }; f(cls("NSString"), sel("stringWithUTF8String:"), c.as_ptr()) }
 
 extern "C" fn yes_imp(_this: id, _sel: SEL) -> Boolean { 1 }
@@ -323,6 +327,35 @@ impl Pump {
     fn push(&self, r: Raw) { self.sh.raw.lock().unwrap().push(r); }
 
     /// One pass: dequeue every pending NSEvent, apply the app's outward state. Call from the main thread.
+    /// macOS has no per-window icon — the titlebar proxy icon represents a
+    /// document, not the app. The Dock icon is the equivalent, and unlike the
+    /// bundle's CFBundleIconFile it can be set at runtime, which is the only
+    /// route open to an unbundled binary.
+    fn apply_icon(&self) {
+        let Some(set) = self.sh.core.take_icon() else { return };
+        // Largest first (own_set sorts); AppKit downscales for the Dock.
+        let Some(img) = set.first() else {
+            send1(self.app, sel("setApplicationIconImage:"), core::ptr::null_mut());
+            return;
+        };
+        // PNG through NSImage rather than NSBitmapImageRep: the latter needs a
+        // ten-argument initialiser whose signature we would have to get exactly
+        // right through objc_msgSend, for no gain.
+        let png = crate::icon::encode_png(&img.as_image());
+        let data = nsdata(&png);
+        if data.is_null() { return; }
+        let obj = send1(send0(cls("NSImage"), sel("alloc")), sel("initWithData:"), data);
+        if obj.is_null() { return; }
+        send1(self.app, sel("setApplicationIconImage:"), obj);
+    }
+
+    /// Block up to `ms` for an NSEvent to become available (peek, no dequeue); pump_once then takes it.
+    pub fn block_ms(&mut self, ms: u64) {
+        let date = send_f(cls("NSDate"), sel("dateWithTimeIntervalSinceNow:"), ms as f64 / 1000.0);
+        let f: extern "C" fn(id, SEL, u64, id, id, bool) -> id = unsafe { core::mem::transmute(objc_msgSend as *const ()) };
+        f(self.app, self.sel_next_event, u64::MAX, date, self.run_loop_mode, false);
+    }
+
     pub fn pump_once(&mut self) {
         let core = &self.sh.core;
         loop {
@@ -369,7 +402,8 @@ impl Pump {
                 _ => { send1(self.app, self.sel_send_event, ev); }
             }
         }
-        // Outward state: cursor, fullscreen (AppKit window surgery belongs to this thread).
+        // Outward state: cursor, fullscreen, icon (AppKit surgery belongs to this thread).
+        self.apply_icon();
         let hidden = core.cursor_hidden.load(Relaxed);
         if hidden != self.cursor_applied { self.cursor_applied = hidden; send0(self.cls_nscursor, if hidden { self.sel_hide } else { self.sel_unhide }); }
         let fs = core.wants_fullscreen.load(Relaxed);
@@ -473,3 +507,93 @@ pub fn open(core: Arc<Core>, title: &str, width: u32, height: u32) -> Option<(Ap
         Some((app_side, pump))
     }
 }
+
+// ---- owning the main thread ------------------------------------------------------------
+// AppKit must be pumped on the main thread, and the app wants a plain polling API on
+// whatever thread called open(). So open() on the main thread does a register/stack
+// handoff: the caller's context (callee-saved registers, sp, return address) is captured;
+// a fresh pthread adopts it and RETURNS from open() as the application, running on the
+// original main-thread stack; the real main thread meanwhile moves to a private stack
+// and pumps AppKit forever. Thread identity is invisible to the app — it is only the
+// kernel's notion of "main thread" that AppKit cares about, and that stays where it is.
+//
+// The handoff is one naked function so that NOT ONE Rust instruction runs on the shared
+// stack between capturing the context and leaving it: capture, publish the flag, switch
+// sp, branch to the pump. The adopting thread returns from `handoff` with 1.
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+unsafe extern "C" fn handoff(ctx: *mut u64, flag: *const u32, new_sp: u64, pump: extern "C" fn(*mut core::ffi::c_void) -> !, arg: *mut core::ffi::c_void) -> u64 {
+    core::arch::naked_asm!(
+        "stp x19, x20, [x0, #0]",
+        "stp x21, x22, [x0, #16]",
+        "stp x23, x24, [x0, #32]",
+        "stp x25, x26, [x0, #48]",
+        "stp x27, x28, [x0, #64]",
+        "stp x29, x30, [x0, #80]",
+        "mov x9, sp",
+        "str x9, [x0, #96]",
+        "stp d8, d9, [x0, #104]",
+        "stp d10, d11, [x0, #120]",
+        "stp d12, d13, [x0, #136]",
+        "stp d14, d15, [x0, #152]",
+        "mov w9, #1",
+        "stlr w9, [x1]",          // publish: the adopting thread may now resume on this stack
+        "mov sp, x2",             // leave it
+        "mov x0, x4",
+        "br x3",                  // pump(arg), never returns
+    )
+}
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+unsafe extern "C" fn resume(ctx: *const u64) -> ! {
+    core::arch::naked_asm!(
+        "ldp x19, x20, [x0, #0]",
+        "ldp x21, x22, [x0, #16]",
+        "ldp x23, x24, [x0, #32]",
+        "ldp x25, x26, [x0, #48]",
+        "ldp x27, x28, [x0, #64]",
+        "ldp x29, x30, [x0, #80]",
+        "ldr x9, [x0, #96]",
+        "mov sp, x9",
+        "ldp d8, d9, [x0, #104]",
+        "ldp d10, d11, [x0, #120]",
+        "ldp d12, d13, [x0, #136]",
+        "ldp d14, d15, [x0, #152]",
+        "mov x0, #1",
+        "ret",                    // returns from handoff() on the original stack, as the app
+    )
+}
+
+#[link(name = "System")]
+unsafe extern "C" { fn pthread_main_np() -> i32; }
+
+extern "C" fn pump_forever(arg: *mut core::ffi::c_void) -> ! {
+    let pump: &mut Pump = unsafe { &mut *(arg as *mut Pump) };
+    loop {
+        pump.pump_once();
+        pump.block_ms(4);
+    }
+}
+
+/// Give the main thread to AppKit. Must be called on the main thread; returns (once) on
+/// a new thread that has taken over the caller's stack and context.
+#[cfg(target_arch = "aarch64")]
+pub fn takeover_main_thread(pump: Pump) -> bool {
+    if unsafe { pthread_main_np() } == 0 { eprintln!("softer_gui: open() must be called on the main thread on macOS"); return false; }
+    let ctx: &'static mut [u64; 24] = Box::leak(Box::new([0u64; 24]));
+    let flag: &'static std::sync::atomic::AtomicU32 = Box::leak(Box::new(std::sync::atomic::AtomicU32::new(0)));
+    let pump_ptr = Box::into_raw(Box::new(pump)) as *mut core::ffi::c_void;
+    // 4 MB private stack for the pump; the Vec is leaked on purpose.
+    let stack: &'static mut Vec<u8> = Box::leak(Box::new(vec![0u8; 4 << 20]));
+    let top = (stack.as_mut_ptr() as u64 + stack.len() as u64) & !15;
+    let ctx_addr = ctx as *mut [u64; 24] as usize;
+    let flag_ref: &'static std::sync::atomic::AtomicU32 = flag;
+    std::thread::Builder::new().name("softer_gui-app".into()).stack_size(64 << 10).spawn(move || {
+        while flag_ref.load(Acquire) == 0 { std::thread::yield_now(); }
+        unsafe { resume(ctx_addr as *const u64) }
+    }).expect("thread");
+    let r = unsafe { handoff(ctx.as_mut_ptr(), flag.as_ptr(), top, pump_forever, pump_ptr) };
+    r == 1
+}
+#[cfg(not(target_arch = "aarch64"))]
+pub fn takeover_main_thread(_pump: Pump) -> bool { eprintln!("softer_gui: macOS backend is Apple Silicon only"); false }

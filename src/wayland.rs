@@ -207,6 +207,10 @@ struct Pump {
     dead: bool,
     // globals
     registry: u32, compositor: u32, subcompositor: u32, viewporter: u32, wm_base: u32, seat: u32,
+    // xdg-toplevel-icon-v1: the manager global, plus the live icon object and the
+    // buffers backing it. Those must outlive the set_icon call — the protocol
+    // raises no_buffer if a buffer dies before the icon it belongs to.
+    icon_mgr: u32, icon_obj: u32, icon_bufs: Vec<u32>, icon_mem: Option<ShmMem>,
     deco_mgr: u32, cursor_mgr: u32, gestures: u32, presentation: u32,
     outputs: [(u32, u64); MAX_OUTPUTS], n_out: usize, surf_out: u32,
     seat_version: u32,
@@ -418,6 +422,65 @@ impl Pump {
         else { self.send(Msg::new(self.toplevel, 5).u(self.seat).u(self.ptr_serial)); }
         self.sh.conn.flush();
     }
+    /// The surface carrying the xdg role — the one whose commit applies
+    /// double-buffered toplevel state.
+    fn role_surface(&self) -> u32 { if self.have_frame { self.frame_surf } else { self.surface } }
+
+    fn apply_icon(&mut self) {
+        let Some(set) = self.core.take_icon() else { return };
+        if self.icon_mgr == 0 || self.toplevel == 0 { return; }
+
+        let old_obj = self.icon_obj;
+        let old_bufs = std::mem::take(&mut self.icon_bufs);
+        let old_mem = self.icon_mem.take();
+        self.icon_obj = 0;
+
+        if set.is_empty() {
+            // A null icon resets the toplevel to its default — which is the icon
+            // from the .desktop file matching our app_id, if there is one.
+            self.send(Msg::new(self.icon_mgr, 2).u(self.toplevel).u(0));
+        } else {
+            // One pool for every size. wl_shm ARGB8888 is PREMULTIPLIED, unlike
+            // _NET_WM_ICON, so the pixels are converted on the way in.
+            let total: usize = set.iter().map(|i| i.argb.len() * 4).sum();
+            if let Some(mem) = ShmMem::new(total) {
+                let pool = self.new_id();
+                self.sh.conn.send_fd(Msg::new(self.sh.shm.load(Relaxed), 0).u(pool).i(total as i32), mem.fd);
+                let icon = self.new_id();
+                self.send(Msg::new(self.icon_mgr, 1).u(icon));   // create_icon
+                let mut off = 0usize;
+                for img in &set {
+                    let n = img.argb.len();
+                    unsafe {
+                        let dst = mem.ptr.add(off) as *mut u32;
+                        for (i, &p) in img.argb.iter().enumerate() {
+                            let a = p >> 24;
+                            let mul = |c: u32| ((c & 0xff) * a + 127) / 255;
+                            *dst.add(i) = (a << 24) | (mul(p >> 16) << 16) | (mul(p >> 8) << 8) | mul(p);
+                        }
+                    }
+                    let buf = self.new_id();
+                    self.send(Msg::new(pool, 0).u(buf).i(off as i32).i(img.side as i32).i(img.side as i32).i((img.side * 4) as i32).u(0));
+                    self.send(Msg::new(icon, 2).u(buf).i(1));   // add_buffer(buffer, scale)
+                    self.icon_bufs.push(buf);
+                    off += n * 4;
+                }
+                self.send(Msg::new(self.icon_mgr, 2).u(self.toplevel).u(icon));   // set_icon
+                self.send(Msg::new(pool, 1));                                     // pool.destroy
+                self.icon_obj = icon;
+                self.icon_mem = Some(mem);
+            }
+        }
+        // set_icon is double-buffered on the toplevel: nothing happens until the
+        // role surface commits, and an idle app may not commit for a long time.
+        self.send(Msg::new(self.role_surface(), 6));
+        // Only now is the previous icon unreferenced.
+        if old_obj != 0 { self.send(Msg::new(old_obj, 0)); }
+        for b in old_bufs { self.send(Msg::new(b, 0)); }
+        drop(old_mem);
+        self.sh.conn.flush();
+    }
+
     fn apply_fullscreen(&mut self) {
         let want = self.core.wants_fullscreen.load(Relaxed);
         if want == self.fs_applied || self.toplevel == 0 { return; }
@@ -468,6 +531,7 @@ impl Pump {
                     "zxdg_decoration_manager_v1" => self.deco_mgr = bind(self, 1),
                     "wp_viewporter" => self.viewporter = bind(self, 1),
                     "wp_cursor_shape_manager_v1" => self.cursor_mgr = bind(self, 1),
+                    "xdg_toplevel_icon_manager_v1" => self.icon_mgr = bind(self, 1),
                     "zwp_pointer_gestures_v1" => self.gestures = bind(self, version.min(3)),
                     "wp_presentation" => { let p = bind(self, version.min(2)); self.presentation = p; self.sh.presentation.store(p, Relaxed); }
                     "wl_output" => if self.n_out < MAX_OUTPUTS { let o = bind(self, version.min(4)); self.outputs[self.n_out] = (o, 0); self.n_out += 1; },
@@ -687,6 +751,7 @@ impl Pump {
             let mut timeout = self.core.repeat_tick(now);
             let hidden = self.core.cursor_hidden.load(Relaxed);
             if hidden != self.cursor_applied { self.cursor_applied = hidden; self.update_cursor(); }
+            self.apply_icon();
             self.apply_fullscreen();
             if self.core.wants_frame.load(Relaxed) {
                 if self.core.in_flight.load(Acquire) == 0 && !self.core.render_pending() && self.configured { self.core.push_render(); }
@@ -712,7 +777,7 @@ fn connect() -> Option<Fd> {
     Some(fd)
 }
 
-pub fn open(core: Arc<Core>, title: &str, width: u32, height: u32) -> Option<App> {
+pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32) -> Option<App> {
     let fd = connect()?;
     let sh = Arc::new(Shared {
         conn: Conn { fd, w: Mutex::new(Writer { buf: Vec::new(), fds: Vec::new(), next_id: 2 }) },
@@ -723,6 +788,7 @@ pub fn open(core: Arc<Core>, title: &str, width: u32, height: u32) -> Option<App
     let mut p = Pump {
         sh: sh.clone(), core: core.clone(), rbuf: vec![0; 1 << 16], rfill: 0, fds: Vec::new(), dead: false,
         registry: 0, compositor: 0, subcompositor: 0, viewporter: 0, wm_base: 0, seat: 0, deco_mgr: 0, cursor_mgr: 0, gestures: 0, presentation: 0,
+        icon_mgr: 0, icon_obj: 0, icon_bufs: Vec::new(), icon_mem: None,
         outputs: [(0, 0); MAX_OUTPUTS], n_out: 0, surf_out: 0, seat_version: 0,
         surface: 0, frame_surf: 0, xdg_surface: 0, toplevel: 0, deco: 0, keyboard: 0, pointer: 0, cursor_dev: 0, pinch: 0,
         frame_pool: 0, frame_bufs: [0; 3], frame_vp: 0, white_surf: 0, white_sub: 0, white_vp: 0, inner_surf: 0, inner_sub: 0, inner_vp: 0, content_sub: 0,
@@ -758,7 +824,10 @@ pub fn open(core: Arc<Core>, title: &str, width: u32, height: u32) -> Option<App
     p.toplevel = p.new_id();
     p.send(Msg::new(p.xdg_surface, 1).u(p.toplevel));
     p.send(Msg::new(p.toplevel, 2).s(title));
-    p.send(Msg::new(p.toplevel, 3).s("softer_gui"));
+    // app_id is how a Wayland compositor finds our .desktop entry, and therefore
+    // our icon when xdg-toplevel-icon-v1 is absent. It must equal the desktop
+    // file basename.
+    p.send(Msg::new(p.toplevel, 3).s(app_id));
     // Ask for server-side decorations; a compositor that answers client_side (or has no
     // manager at all — Mutter) gets our bevel instead.
     if p.deco_mgr != 0 {

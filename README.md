@@ -11,27 +11,31 @@ pre-panel-WM version at commit `0752368`), minus the tab WM, audio and gamepads.
 
 ## Model
 
+Plain polling, no callbacks, no closures:
+
 ```rust
-softer_gui::run("title", 640, 480, |mut gui| {
-    loop {
-        gui.wait();
-        while let Some(ev) = gui.next_event() {
-            match ev.kind {
-                Kind::Render(r) => {
-                    // ev.t_fs is DISPLAY time (fs); r.dt_fs the nominal period.
-                    let Some(fb) = gui.get_framebuffer() else { continue };   // None: backpressure, skip
-                    draw(fb.pixels, fb.side, fb.width, fb.height, fb.key);
-                    gui.submit();
-                }
-                Kind::Buttons(b) => { /* absolute 512-bit snapshot: keys + mouse buttons, evdev codes */ }
-                Kind::Text(t) => { /* layout-aware codepoints */ }
-                Kind::Axes(a) => { /* MOUSE_X/Y absolute 24.8, SCROLL_V/H 24.8 px, ZOOM/ROTATE 16.16 */ }
-                Kind::CopyPaste(_) | Kind::Close | Kind::None => {}
+let mut gui = softer_gui::open("title", "com.example.app", 640, 480).unwrap();
+let mut ev = Event::default();
+loop {
+    gui.wait();                                   // sleeps until the ring has something
+    while gui.next_event(&mut ev) {
+        match ev.kind {
+            EVENT_RENDER => {
+                // ev.t_fs is DISPLAY time (fs); ev.dt_fs the nominal period; ev.width/height/cursor_x/cursor_y.
+                let mut fb = gui.get_framebuffer();   // fb.pixels null = backpressure, skip this frame
+                if fb.ok() { draw(fb.slice(), fb.side, fb.width, fb.height, fb.key); gui.submit(); }
             }
+            EVENT_BUTTONS => { if ev.button(KEY_ESC) { return; } }   // absolute 512-bit snapshot, evdev codes
+            EVENT_TEXT => { for c in ev.text() { /* layout-aware codepoints */ } }
+            EVENT_AXES => { for a in ev.axes() { /* MOUSE_X/Y abs 24.8, SCROLL_V/H 24.8 px, ZOOM/ROTATE 16.16 */ } }
+            EVENT_CLOSE => return,
+            _ => {}
         }
     }
-});
+}
 ```
+
+`Event` is one flat struct with a `kind` tag; only the fields for that kind are set.
 
 * **Display time.** Every event is stamped with a 128-bit femtosecond clock that
   advances only at frame boundaries, in whole refresh periods (X11: Present msc;
@@ -61,8 +65,10 @@ softer_gui::run("title", 640, 480, |mut gui| {
 
 Linux: a pump thread owns the socket's read side, produces every event and runs
 the frame clock; the app thread consumes and only writes present/attach requests
-through a mutex. macOS: the main thread must pump AppKit, so `run` keeps it
-there, the CVDisplayLink thread is the producer, and the app runs on a second thread.
+through a mutex. macOS: `open` (called on the main thread) captures the caller's
+registers and stack, hands them to a new thread which returns from `open` as the
+app, and keeps the real main thread pumping AppKit on a private stack; the
+CVDisplayLink thread is the producer. Same polling API on every platform.
 
 ## Status
 

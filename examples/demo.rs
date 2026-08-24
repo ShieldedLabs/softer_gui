@@ -7,7 +7,9 @@ use softer_gui::*;
 fn fill(fb: &mut Framebuffer, x0: i64, y0: i64, x1: i64, y1: i64, c: u32) {
     let (w, h) = (fb.width as i64, fb.height as i64);
     let (x0, y0, x1, y1) = (x0.max(0), y0.max(0), x1.min(w), y1.min(h));
-    for y in y0..y1 { let row = y as usize * fb.side; for x in x0..x1 { fb.pixels[row + x as usize] = c; } }
+    let side = fb.side;
+    let px = fb.slice();
+    for y in y0..y1 { let row = y as usize * side; for x in x0..x1 { px[row + x as usize] = c; } }
 }
 
 // 3x5 digit glyphs for the HUD, one bit per pixel, rows top to bottom.
@@ -24,8 +26,56 @@ fn number(fb: &mut Framebuffer, x: i64, y: i64, mut v: u64, s: i64, c: u32) {
     for (i, d) in ds.iter().rev().enumerate() { digit(fb, x + i as i64 * 4 * s, y, *d, s, c); }
 }
 
+const APP_ID: &str = "lol.softer.demo";
+
+/// The demo's own icon, drawn rather than shipped: a rounded teal square with the
+/// bouncing box on it, at every size the desktops ask for. Straight alpha.
+fn make_icon(side: u32) -> softer_gui::icon::OwnedIcon {
+    let mut ic = softer_gui::icon::placeholder(side, 0x0e_7c_7b);
+    let n = side as i64;
+    // The white box, proportional so it reads the same at 16px as at 256px.
+    let (x0, y0) = (n * 5 / 16, n * 5 / 16);
+    let (x1, y1) = (n * 11 / 16, n * 11 / 16);
+    for y in y0..y1 {
+        for x in x0..x1 { ic.argb[(y * n + x) as usize] = 0xff_ff_ff_ff; }
+    }
+    ic
+}
+
 fn main() {
-    if !softer_gui::run("softer_gui demo", 640, 480, app) { eprintln!("could not open a window"); }
+    let sizes: Vec<u32> = match std::env::var("SOFTER_GUI_ICON_SIZES") {
+        Ok(v) => v.split(',').filter_map(|s| s.trim().parse().ok()).collect(),
+        Err(_) => vec![16, 24, 32, 48, 64, 128, 256],
+    };
+    let icons: Vec<softer_gui::icon::OwnedIcon> = sizes.iter().map(|s| make_icon(*s)).collect();
+
+    // Desktop integration is opt-in and explicit: it writes files into $HOME, so
+    // the user asks for it rather than getting it for having run the program.
+    let arg = std::env::args().nth(1).unwrap_or_default();
+    if arg == "--install" || arg == "--uninstall" {
+        let info = softer_gui::install::AppInfo {
+            comment: "softer_gui pacing and input demo",
+            categories: "Development;Graphics;",
+            ..softer_gui::install::AppInfo::new(APP_ID, "Softer GUI Demo", &icons)
+        };
+        let r = if arg == "--install" { softer_gui::install::install(&info) } else { softer_gui::install::uninstall(APP_ID, info.name) };
+        match r {
+            Ok(done) => { for f in &done.files { println!("{} {}", if arg == "--install" { "wrote" } else { "removed" }, f.display()); } }
+            Err(e) => { eprintln!("{arg} failed: {e}"); std::process::exit(1); }
+        }
+        return;
+    }
+
+    let Some(mut gui) = softer_gui::open("softer_gui demo", APP_ID, 640, 480) else {
+        eprintln!("could not open a window");
+        return;
+    };
+    // The icon is set after open, not passed to it: X11 and Wayland both accept a
+    // change at any time, so there is no reason for the window constructor to grow
+    // a parameter for it.
+    let images: Vec<softer_gui::icon::IconImage> = icons.iter().map(|i| i.as_image()).collect();
+    gui.set_icon(&images);
+    app(gui);
 }
 
 fn app(mut gui: Gui) {
@@ -35,7 +85,8 @@ fn app(mut gui: Gui) {
     let (mut bx, mut by) = (60.0f64, 60.0f64);
     let (mut vx, mut vy) = (240.0f64, 180.0f64);   // px/s
     let mut last_t: u128 = 0;
-    let mut buttons = Buttons::default();
+    let mut buttons = Event::default();
+    let mut ev = Event::default();
     let mut typed: Vec<char> = Vec::new();
     let (mut scroll_x, mut scroll_y) = (0i64, 0i64);
     let mut zoom = 1.0f64;
@@ -50,19 +101,19 @@ fn app(mut gui: Gui) {
 
     'outer: loop {
         gui.wait();
-        while let Some(ev) = gui.next_event() {
+        while gui.next_event(&mut ev) {
             match ev.kind {
-                Kind::Close => break 'outer,
-                Kind::Buttons(b) => {
-                    if b.get(KEY_ESC) { break 'outer; }
-                    if b.get(KEY_F11) && !buttons.get(KEY_F11) { let f = !gui.is_fullscreen(); gui.set_fullscreen(f); }
-                    if b.get(KEY_BACKSPACE) && !buttons.get(KEY_BACKSPACE) { typed.pop(); }
-                    if b.get(BTN_LEFT) != buttons.get(BTN_LEFT) { gui.set_cursor_hidden(b.get(BTN_LEFT)); println!("left button {} at {},{}", b.get(BTN_LEFT), mx, my); }
-                    buttons = b;
+                EVENT_CLOSE => break 'outer,
+                EVENT_BUTTONS => {
+                    if ev.button(KEY_ESC) { break 'outer; }
+                    if ev.button(KEY_F11) && !buttons.button(KEY_F11) { let f = !gui.is_fullscreen(); gui.set_fullscreen(f); }
+                    if ev.button(KEY_BACKSPACE) && !buttons.button(KEY_BACKSPACE) { typed.pop(); }
+                    if ev.button(BTN_LEFT) != buttons.button(BTN_LEFT) { gui.set_cursor_hidden(ev.button(BTN_LEFT)); println!("left button {} at {},{}", ev.button(BTN_LEFT), mx, my); }
+                    buttons = ev;
                 }
-                Kind::Text(t) => { for c in t.as_chars() { typed.push(*c); } println!("text: {:?}", typed.iter().collect::<String>()); }
-                Kind::CopyPaste(a) => println!("copypaste {a}"),
-                Kind::Axes(a) => for d in a.as_slice() {
+                EVENT_TEXT => { for c in ev.text() { typed.push(*c); } println!("text: {:?}", typed.iter().collect::<String>()); }
+                EVENT_COPYPASTE => println!("copypaste {}", ev.action),
+                EVENT_AXES => for d in ev.axes() {
                     if d.axis >= AXIS_SCROLL_V { println!("axis {} delta {}", d.axis, d.delta); }
                     match d.axis {
                         AXIS_MOUSE_X => mx = d.delta as i64 >> 8,
@@ -74,7 +125,8 @@ fn app(mut gui: Gui) {
                         _ => {}
                     }
                 },
-                Kind::Render(r) => {
+                EVENT_RENDER => {
+                    let r = ev;
                     if start_disp.is_none() { start_disp = Some(ev.t_fs); }
                     // Step by DISPLAY time: exact multiples of the period, catch-up over drops.
                     if last_t != 0 {
@@ -90,7 +142,8 @@ fn app(mut gui: Gui) {
                         if by < hs { by = hs; vy = -vy } if by > h - hs { by = h - hs; vy = -vy }
                     }
                     last_t = ev.t_fs;
-                    let Some(mut fb) = gui.get_framebuffer() else { skipped += 1; continue };
+                    let mut fb = gui.get_framebuffer();
+                    if !fb.ok() { skipped += 1; continue; }
                     if fb.key >> 1 != last_gen { last_gen = fb.key >> 1; println!("framebuffer generation {last_gen}: side {} window {}x{}", fb.side, fb.width, fb.height); }
                     frames += 1;
                     let now = std::time::Instant::now();
@@ -98,12 +151,14 @@ fn app(mut gui: Gui) {
                     if ft_us > ft_max { ft_max = ft_us; }
                     // Background, scroll-driven grid so scrolling is visible.
                     let (w, h) = (fb.width, fb.height);
+                    let side = fb.side;
+                    let px = fb.slice();
                     for y in 0..h {
-                        let row = y * fb.side;
+                        let row = y * side;
                         let gy = ((y as i64 + (scroll_y >> 8)) & 63) < 2;
                         for x in 0..w {
                             let gx = ((x as i64 + (scroll_x >> 8)) & 63) < 2;
-                            fb.pixels[row + x] = if gx || gy { 0xFF303040 } else { 0xFF181820 };
+                            px[row + x] = if gx || gy { 0xFF303040 } else { 0xFF181820 };
                         }
                     }
                     let hs = (25.0 * zoom) as i64;
@@ -129,7 +184,7 @@ fn app(mut gui: Gui) {
                     fill(&mut fb, 0, 0, 1, h as i64, 0xFFFF00FF); fill(&mut fb, w as i64 - 1, 0, w as i64, h as i64, 0xFFFF00FF);
                     gui.submit();
                 }
-                Kind::None => {}
+                _ => {}
             }
         }
         if last_report.elapsed().as_secs() >= 2 {

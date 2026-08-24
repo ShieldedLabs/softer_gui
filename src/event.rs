@@ -73,8 +73,32 @@ pub const CP_COPY: u32 = 1;
 pub const CP_CUT: u32 = 2;
 pub const CP_PASTE: u32 = 3;
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Render {
+pub const EVENT_NONE: u32 = 0;
+/// A frame boundary passed: draw the current state. Fields: width, height, scale_fx, cursor_x/y, dt_fs.
+pub const EVENT_RENDER: u32 = 1;
+/// Absolute snapshot of every key and mouse button (evdev codes). Fields: bits, modes.
+pub const EVENT_BUTTONS: u32 = 2;
+/// Layout-aware text. Fields: text, text_len.
+pub const EVENT_TEXT: u32 = 3;
+/// Copy/cut/paste intent. Field: action (CP_*).
+pub const EVENT_COPYPASTE: u32 = 4;
+/// Continuous input. Fields: axes, axis_count.
+pub const EVENT_AXES: u32 = 5;
+/// The window was asked to close.
+pub const EVENT_CLOSE: u32 = 6;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AxisDiff { pub axis: u32, pub delta: i32 }
+
+/// One event. `kind` says which fields are meaningful; the rest are zero.
+/// A flat struct on purpose: it is what goes into the ring, and it reads like C.
+#[derive(Clone, Copy, Debug)]
+pub struct Event {
+    pub kind: u32,
+    pub device: u32,
+    /// Display time, femtoseconds (see the module doc).
+    pub t_fs: u128,
+    // EVENT_RENDER
     pub width: u32,
     pub height: u32,
     /// UI scale, 16.16 fixed (65536 = 1.0).
@@ -84,51 +108,32 @@ pub struct Render {
     pub cursor_y: i64,
     /// Nominal frame period (1 s / refresh rate), femtoseconds. Not a measurement.
     pub dt_fs: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Buttons {
-    /// Absolute snapshot of all 512 discrete inputs (keys and mouse buttons in one evdev code space).
+    // EVENT_BUTTONS
     pub bits: [u64; 8],
     /// MODE_* flags — armed dead key etc.
     pub modes: u8,
-}
-impl Buttons {
-    #[inline] pub fn get(&self, code: u32) -> bool { (self.bits[(code as usize >> 6) & 7] >> (code & 63)) & 1 != 0 }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Text { pub len: u8, pub chars: [char; 19] }
-impl Text {
-    pub fn as_chars(&self) -> &[char] { &self.chars[..self.len as usize] }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct AxisDiff { pub axis: u32, pub delta: i32 }
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Axes { pub count: u8, pub axes: [AxisDiff; 11] }
-impl Axes {
-    pub fn as_slice(&self) -> &[AxisDiff] { &self.axes[..self.count as usize] }
+    // EVENT_TEXT
+    pub text_len: u8,
+    pub text: [char; 19],
+    // EVENT_COPYPASTE
+    pub action: u32,
+    // EVENT_AXES
+    pub axis_count: u8,
+    pub axes: [AxisDiff; 11],
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum Kind {
-    None,
-    Render(Render),
-    Buttons(Buttons),
-    Text(Text),
-    CopyPaste(u32),
-    Axes(Axes),
-    Close,
+impl Default for Event {
+    fn default() -> Event {
+        Event { kind: EVENT_NONE, device: 0, t_fs: 0, width: 0, height: 0, scale_fx: 0, cursor_x: 0, cursor_y: 0, dt_fs: 0,
+                bits: [0; 8], modes: 0, text_len: 0, text: ['\0'; 19], action: 0, axis_count: 0, axes: [AxisDiff::default(); 11] }
+    }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct Event {
-    /// Display time, femtoseconds.
-    pub t_fs: u128,
-    pub device: u32,
-    pub kind: Kind,
+impl Event {
+    /// EVENT_BUTTONS: is this evdev code held?
+    #[inline] pub fn button(&self, code: u32) -> bool { (self.bits[(code as usize >> 6) & 7] >> (code & 63)) & 1 != 0 }
+    pub fn text(&self) -> &[char] { &self.text[..self.text_len as usize] }
+    pub fn axes(&self) -> &[AxisDiff] { &self.axes[..self.axis_count as usize] }
 }
 
 // ---- pump-owned keyboard / clock state -------------------------------------
@@ -178,6 +183,11 @@ pub struct Core {
     pub in_flight: AtomicU32,
     /// Bumped by the pump to poke the app-side wait (resize, etc.).
     pub title_changed: AtomicBool,
+    /// Window icon, largest first. The pump applies it and clears `icon_dirty`.
+    /// Behind a Mutex rather than in the ring because it is bulk state the app
+    /// replaces wholesale, not an event with a place in the order.
+    pub icon: std::sync::Mutex<Vec<crate::icon::OwnedIcon>>,
+    pub icon_dirty: AtomicBool,
 }
 
 unsafe impl Sync for Core {}
@@ -189,7 +199,7 @@ impl Core {
     pub fn new() -> Core {
         let t = now_ns();
         Core {
-            ring: core::array::from_fn(|_| UnsafeCell::new(Event { t_fs: 0, device: 0, kind: Kind::None })),
+            ring: core::array::from_fn(|_| UnsafeCell::new(Event::default())),
             head: AtomicU64::new(0),
             tail: AtomicU64::new(0),
             head_futex: AtomicU32::new(0),
@@ -226,21 +236,24 @@ impl Core {
             focused: AtomicBool::new(true),
             in_flight: AtomicU32::new(0),
             title_changed: AtomicBool::new(false),
+            icon: std::sync::Mutex::new(Vec::new()),
+            icon_dirty: AtomicBool::new(false),
         }
     }
 
     // ---- producer side (pump thread only) --------------------------------------
 
     /// Reserve a slot; None when the ring is full (the event is dropped and a resync is owed).
-    fn reserve(&self, kind: Kind) -> Option<u64> {
+    fn reserve(&self, mut ev: Event) -> Option<u64> {
         let head = self.head.load(Relaxed);
         let tail = self.tail.load(Acquire);
         if head - tail >= RING as u64 {
             ps!(self).resync_pending = true;
             return None;
         }
-        let (t_fs, device) = (ps!(self).disp_fs, ps!(self).device);
-        unsafe { *self.ring[(head as usize) & (RING - 1)].get() = Event { t_fs, device, kind }; }
+        ev.t_fs = ps!(self).disp_fs;
+        ev.device = ps!(self).device;
+        unsafe { *self.ring[(head as usize) & (RING - 1)].get() = ev; }
         Some(head)
     }
     fn commit(&self, id: u64) {
@@ -253,16 +266,16 @@ impl Core {
             { let _g = self.park.0.lock().unwrap(); self.park.1.notify_one(); }
         }
     }
-    fn push(&self, kind: Kind) -> bool {
-        match self.reserve(kind) { Some(id) => { self.commit(id); true } None => false }
+    fn push(&self, ev: Event) -> bool {
+        match self.reserve(ev) { Some(id) => { self.commit(id); true } None => false }
     }
 
-    pub fn push_close(&self) { self.push(Kind::Close); }
-    pub fn push_copypaste(&self, action: u32) { self.push(Kind::CopyPaste(action)); }
+    pub fn push_close(&self) { self.push(Event { kind: EVENT_CLOSE, ..Event::default() }); }
+    pub fn push_copypaste(&self, action: u32) { self.push(Event { kind: EVENT_COPYPASTE, action, ..Event::default() }); }
 
     pub fn push_button_snapshot(&self) {
-        let b = Buttons { bits: ps!(self).keybits, modes: ps!(self).mode_flags };
-        self.push(Kind::Buttons(b));
+        let ev = Event { kind: EVENT_BUTTONS, bits: ps!(self).keybits, modes: ps!(self).mode_flags, ..Event::default() };
+        self.push(ev);
     }
 
     /// Pay off an owed snapshot once there is room again. Call at the top of every pump pass.
@@ -297,9 +310,9 @@ impl Core {
     }
 
     pub fn push_text(&self, chars: &[char]) {
-        let mut t = Text::default();
-        for c in chars.iter().take(19) { t.chars[t.len as usize] = *c; t.len += 1; }
-        if t.len > 0 { self.push(Kind::Text(t)); }
+        let mut ev = Event { kind: EVENT_TEXT, ..Event::default() };
+        for c in chars.iter().take(19) { ev.text[ev.text_len as usize] = *c; ev.text_len += 1; }
+        if ev.text_len > 0 { self.push(ev); }
     }
     /// One Text event per codepoint (streams must not reduce last-wins). Control chars dropped.
     pub fn push_text_str(&self, s: &str) -> Option<char> {
@@ -313,9 +326,9 @@ impl Core {
     }
 
     pub fn push_axes(&self, diffs: &[AxisDiff]) {
-        let mut a = Axes::default();
-        for d in diffs.iter().take(11) { a.axes[a.count as usize] = *d; a.count += 1; }
-        if a.count > 0 { self.push(Kind::Axes(a)); }
+        let mut ev = Event { kind: EVENT_AXES, ..Event::default() };
+        for d in diffs.iter().take(11) { ev.axes[ev.axis_count as usize] = *d; ev.axis_count += 1; }
+        if ev.axis_count > 0 { self.push(ev); }
     }
 
     /// A RENDER means "a frame boundary passed, draw the current state" — it is not
@@ -324,15 +337,17 @@ impl Core {
     /// stale-low tail can only make us drop one extra RENDER, never stall the clock.
     pub fn push_render(&self) -> bool {
         if ps!(self).render_id_p1 != 0 && ps!(self).render_id_p1 - 1 >= self.tail.load(Acquire) { return false; }
-        let r = Render {
+        let r = Event {
+            kind: EVENT_RENDER,
             width: self.win_w.load(Relaxed),
             height: self.win_h.load(Relaxed),
             scale_fx: self.scale_fx.load(Relaxed),
             cursor_x: self.cursor_x.load(Relaxed),
             cursor_y: self.cursor_y.load(Relaxed),
             dt_fs: ps!(self).disp_period_fs,
+            ..Event::default()
         };
-        if let Some(id) = self.reserve(Kind::Render(r)) {
+        if let Some(id) = self.reserve(r) {
             ps!(self).render_id_p1 = id + 1;
             self.commit(id);
             self.wants_frame.store(false, Relaxed);
@@ -445,18 +460,30 @@ impl Core {
         let left = ps!(self).repeat_deadline_ns.saturating_sub(now_ns);
         ((left / 1_000_000) as i32).clamp(1, 100)
     }
+    /// Replace the window icon set. The pump picks it up on its next pass.
+    pub fn set_icon(&self, images: Vec<crate::icon::OwnedIcon>) {
+        *self.icon.lock().unwrap() = images;
+        self.icon_dirty.store(true, Release);
+    }
+    /// Pump side: take the icon set if it changed since the last call.
+    pub fn take_icon(&self) -> Option<Vec<crate::icon::OwnedIcon>> {
+        if !self.icon_dirty.swap(false, AcqRel) { return None; }
+        Some(self.icon.lock().unwrap().clone())
+    }
+
     pub fn set_repeat(&self, delay_ms: u64, interval_ms: u64) {
         ps!(self).repeat_delay_ns = delay_ms * 1_000_000;
         ps!(self).repeat_interval_ns = interval_ms * 1_000_000;
     }
 
     // ---- consumer side (app thread only) ----------------------------------------
-    pub fn next_event(&self) -> Option<Event> {
+    /// Copy the next event into `out`; false when the ring is empty.
+    pub fn next_event(&self, out: &mut Event) -> bool {
         let tail = self.tail.load(Relaxed);
-        if tail == self.head.load(Acquire) { return None; }
-        let ev = unsafe { *self.ring[(tail as usize) & (RING - 1)].get() };
+        if tail == self.head.load(Acquire) { return false; }
+        *out = unsafe { *self.ring[(tail as usize) & (RING - 1)].get() };
         self.tail.store(tail + 1, Release);
-        Some(ev)
+        true
     }
     pub fn has_events(&self) -> bool { self.tail.load(Relaxed) != self.head.load(Acquire) }
 

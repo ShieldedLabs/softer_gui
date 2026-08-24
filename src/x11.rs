@@ -26,7 +26,7 @@ const FREE_PIXMAP: u8 = 54;
 const QUERY_EXTENSION: u8 = 98;
 
 // Atoms we intern once.
-struct Atoms { wm_protocols: u32, wm_delete: u32, net_wm_sync: u32, net_wm_sync_counter: u32, net_wm_state: u32, net_wm_fullscreen: u32, net_wm_name: u32, utf8_string: u32, net_wm_pid: u32 }
+struct Atoms { wm_protocols: u32, wm_delete: u32, net_wm_sync: u32, net_wm_sync_counter: u32, net_wm_state: u32, net_wm_fullscreen: u32, net_wm_name: u32, utf8_string: u32, net_wm_pid: u32, net_wm_icon: u32 }
 
 struct Ext { present: u8, shm: u8, sync: u8, xfixes: u8, randr: u8, rr_event: u8, xkb: u8, xkb_event: u8, xi: u8 }
 
@@ -74,12 +74,16 @@ fn intern_atom(conn: &Conn, r: &mut Reader, name: &[u8]) -> u32 {
     r.wait_reply(seq).map(|p| rd32(&p, 8)).unwrap_or(0)
 }
 fn change_property(conn: &Conn, win: u32, prop: u32, ty: u32, format: u8, data: &[u8]) {
+    change_property_mode(conn, win, prop, ty, format, 0, data)   // 0 = Replace
+}
+/// mode: 0 Replace, 1 Prepend, 2 Append.
+fn change_property_mode(conn: &Conn, win: u32, prop: u32, ty: u32, format: u8, mode: u8, data: &[u8]) {
     let mut b = Vec::new();
     b.extend_from_slice(&u32b(win)); b.extend_from_slice(&u32b(prop)); b.extend_from_slice(&u32b(ty));
     b.push(format); b.extend_from_slice(&[0, 0, 0]);
     b.extend_from_slice(&u32b((data.len() / (format as usize / 8)) as u32));
     b.extend_from_slice(data);
-    conn.req(CHANGE_PROPERTY, 0, &b);   // mode 0 = replace
+    conn.req(CHANGE_PROPERTY, mode, &b);
 }
 
 impl App {
@@ -286,6 +290,37 @@ impl Pump {
         if want == self.cursor_applied || self.sh.ext.xfixes == 0 { return; }
         self.cursor_applied = want;
         self.sh.conn.req(self.sh.ext.xfixes, if want { 29 } else { 30 }, &u32b(self.sh.win));
+        self.sh.conn.flush();
+    }
+    fn apply_icon(&mut self) {
+        let Some(set) = self.core.take_icon() else { return };
+        if self.atoms.net_wm_icon == 0 { return; }
+        // _NET_WM_ICON is one CARDINAL/32 array holding every size back to back:
+        // width, height, then width*height pixels of ARGB with the alpha in the
+        // high byte. Straight alpha, not premultiplied.
+        //
+        // The Xlib trap where format 32 means C `long` (and so 64 bits on LP64)
+        // does not exist here: we write the wire, and the wire says 32.
+        let mut data: Vec<u8> = Vec::with_capacity(set.iter().map(|i| 8 + i.argb.len() * 4).sum());
+        for img in &set {
+            data.extend_from_slice(&u32b(img.side));
+            data.extend_from_slice(&u32b(img.side));
+            for p in &img.argb { data.extend_from_slice(&u32b(*p)); }
+        }
+        // One Replace then Appends. A server need only accept 256 KiB per request
+        // without BIG-REQUESTS, and a single 256x256 image is exactly that; 64 KiB
+        // chunks stay clear of the limit for any set. An empty set writes one empty
+        // Replace, which clears the property.
+        if self.debug { eprintln!("apply_icon: {} images, {} bytes", set.len(), data.len()); }
+        const CHUNK: usize = 64 * 1024;
+        let (mut off, mut mode) = (0usize, 0u8);
+        loop {
+            let end = (off + CHUNK).min(data.len());
+            change_property_mode(&self.sh.conn, self.sh.win, self.atoms.net_wm_icon, 6, 32, mode, &data[off..end]);
+            mode = 2;
+            off = end;
+            if off >= data.len() { break; }
+        }
         self.sh.conn.flush();
     }
     fn apply_fullscreen(&mut self) {
@@ -498,6 +533,7 @@ impl Pump {
             let now = sys::clock_monotonic_ns();
             let mut timeout = self.core.repeat_tick(now);
             self.apply_cursor();
+            self.apply_icon();
             self.apply_fullscreen();
             if self.core.wants_frame.load(Relaxed) {
                 if self.core.in_flight.load(Acquire) == 0 && !self.core.render_pending() { self.core.push_render(); }
@@ -517,7 +553,7 @@ impl Pump {
 // ============================================================================
 // Open
 // ============================================================================
-pub fn open(core: Arc<Core>, title: &str, width: u32, height: u32) -> Option<App> {
+pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32) -> Option<App> {
     let conn = Conn::open()?;
     let mut r = Reader::new(conn.fd);
 
@@ -603,11 +639,21 @@ pub fn open(core: Arc<Core>, title: &str, width: u32, height: u32) -> Option<App
         net_wm_name: intern_atom(&conn, &mut r, b"_NET_WM_NAME"),
         utf8_string: intern_atom(&conn, &mut r, b"UTF8_STRING"),
         net_wm_pid: intern_atom(&conn, &mut r, b"_NET_WM_PID"),
+        net_wm_icon: intern_atom(&conn, &mut r, b"_NET_WM_ICON"),
     };
     change_property(&conn, win, 39, 31, 8, title.as_bytes());   // WM_NAME / STRING
     change_property(&conn, win, atoms.net_wm_name, atoms.utf8_string, 8, title.as_bytes());
-    change_property(&conn, win, 67, 31, 8, title.as_bytes());   // WM_CLASS-ish hint: WM_ICON_NAME
-    let _ = atoms.net_wm_pid;
+    // WM_CLASS (atom 67) is instance\0class\0 — two NUL-TERMINATED strings, not one
+    // label. Desktops match a running window to its .desktop entry through this
+    // (StartupWMClass), so a malformed value costs you the launcher icon and gets
+    // the window a second, generic taskbar group.
+    let mut wm_class = Vec::with_capacity(app_id.len() * 2 + 2);
+    wm_class.extend_from_slice(app_id.as_bytes()); wm_class.push(0);
+    wm_class.extend_from_slice(app_id.as_bytes()); wm_class.push(0);
+    change_property(&conn, win, 67, 31, 8, &wm_class);
+    if atoms.net_wm_pid != 0 {
+        change_property(&conn, win, atoms.net_wm_pid, 6, 32, &u32b(std::process::id()));
+    }
 
     // _NET_WM_SYNC_REQUEST counter, best effort and independent of the close protocol.
     let mut sync_counter = 0u32;
