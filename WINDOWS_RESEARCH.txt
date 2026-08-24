@@ -1,0 +1,1250 @@
+================================================================================
+softer_gui — WINDOWS BACKEND RESEARCH
+================================================================================
+
+Written 2026-08-24. Research only: no Windows code exists in this crate yet.
+
+PROVENANCE. This is the written-up form of a design conversation about doing
+software rendering on Windows for this crate. It was grounded by reading
+src/event.rs, src/sys.rs, src/lib.rs, Cargo.toml, .cargo/config.toml and
+rust-toolchain.toml as they stood on 2026-08-24. Nothing here has been compiled
+or run on Windows. Section 17 lists every claim that should be re-verified
+against current documentation before you lean on it.
+
+HOW TO READ THIS. Sections 0-4 are constraints — they bind the design and you
+cannot engineer around them, so read them before forming any plan. Sections 5-9
+are the rendering and presentation design proper, which is what was actually
+researched in depth. Sections 10-13 are the rest of the backend surface, covered
+more thinly because the conversation did not go there; treat them as a map of
+what remains, not as finished research. Sections 14-17 are build, ordering, open
+questions, and a confidence audit.
+
+A recurring theme worth stating up front: on Linux this crate's hard part was
+never drawing pixels, it was vblank-exact pacing, and Windows is the same. Every
+Windows presentation path will put pixels on screen in an afternoon. Only some of
+them will tell you when the pixels were shown, and that is the whole game for
+this crate's event model.
+
+
+================================================================================
+0. EXECUTIVE SUMMARY — THE FINDINGS THAT ACTUALLY BIND
+================================================================================
+
+Five findings dominate everything else. If you read nothing else, read these.
+
+(0.1) RUST'S OWN WINDOWS FLOOR IS WINDOWS 10, NOT WINDOWS 95.
+      The stated ambition was "one binary running on as many versions of Windows
+      as possible." For a C program that is achievable down to Windows 95. For
+      this crate it is not, because Rust's std dropped support for Windows 7/8/
+      8.1 (believed to be Rust 1.78; this crate pins 1.94.0). Standard
+      *-pc-windows-msvc targets require Windows 10. There are tier-3
+      *-win7-windows-msvc targets, and below that you would need #![no_std].
+      CONSEQUENCE: pick a floor deliberately (see 2.3). The rest of this document
+      assumes Windows 10 unless a subsection says otherwise. Windows 10 also
+      happens to unlock every good pacing API, so the constraint and the design
+      pull in the same direction — which is lucky, and worth noticing.
+
+(0.2) sys.rs's ENTIRE APPROACH CANNOT BE PORTED.
+      Windows has no stable syscall ABI. Syscall numbers are per-build ntdll
+      implementation detail and change between Windows versions and even updates.
+      The supported boundary is the DLL export, so a Windows backend MUST import
+      from kernel32/user32/gdi32/d3d11/dxgi. This does NOT violate the crate's
+      zero-crate-dependency rule (see section 4) — it is `extern "system"` blocks
+      and `#[link]`, not a dependency — but it means src/sys.rs is a Linux file
+      and Windows needs a parallel src/sys_win.rs with a completely different
+      shape.
+
+(0.3) THERE IS NO ZERO-COPY HANDOFF TO THE COMPOSITOR. NOT ANYWHERE. NOT EVER.
+      On Wayland you hand wl_shm a file descriptor and the compositor samples
+      your pages. On X11 with MIT-SHM you do the same through a shm pixmap.
+      Windows has no equivalent exposed to applications; DWM will not scan out
+      CPU memory that you own. Every presentation path copies your pixels out.
+      Budget exactly one mandatory CPU->GPU copy per frame and design around it
+      rather than hunting for a way to avoid it, because there isn't one.
+
+(0.4) WINDOWS WANTS ONE CPU BUFFER, NOT TWO. THE SECOND ONE COSTS YOU.
+      The double buffer exists on Linux because the compositor HOLDS your buffer
+      until it releases it. Windows copies synchronously and hands the buffer
+      straight back. Keeping two buffers on Windows therefore buys nothing and
+      actively makes incremental rendering more expensive, because the buffer you
+      are about to draw into holds frame N-2 rather than N-1. Full argument in
+      section 6. Core::busy[2] and the (gen<<1|idx) key become vestigial.
+
+(0.5) THE PRESENT PATH IS D3D11 + A DXGI FLIP-MODEL SWAPCHAIN.
+      Not GDI. GDI will show pixels but supplies no timing information at any
+      Windows version, so building this crate's display clock on it is
+      impossible. The flip-model swapchain's waitable object plus
+      DXGI_FRAME_STATISTICS is the only thing on Windows that is a real analog of
+      X11 Present's MSC/UST. Section 8 is the important section of this document.
+
+
+================================================================================
+1. WHAT IS BEING PORTED — THE MODEL AS IT EXISTS TODAY
+================================================================================
+
+Restating the existing design, because the Windows decisions below only make
+sense against it. Read src/event.rs alongside this; it is the authority.
+
+1.1 THE EVENT MODEL
+    One totally ordered SPSC ring (RING = 256, power of two, masked indexing)
+    carrying BOTH input events AND frame boundaries. Producer is the pump thread,
+    consumer is the app thread. Kinds: None, Render, Buttons, Text, CopyPaste,
+    Axes, Close.
+
+    The load-bearing property: RENDER is IN the same stream as input, so the app
+    sees input and frame boundaries in one order with no separate "is it time to
+    draw" question. A RENDER is not queued work — Core::push_render() drops a new
+    RENDER if the previous one is still unconsumed, because a frame boundary that
+    the app never got around to is not worth remembering.
+
+1.2 DISPLAY TIME
+    Event::t_fs is 128-bit femtoseconds. It is NOT the system clock. It advances
+    ONLY at frame boundaries and ONLY in whole refresh periods, via
+    Core::display_tick(frames), which does:
+
+       p.disp_fs += p.disp_period_fs as u128 * frames as u128;
+
+    disp_period_fs is the nominal period (1 s / refresh rate), defaulted to
+    1_000_000_000_000_000 / 60 and overwritten by Core::set_period_fs() once the
+    real refresh rate is known. Every event within a frame shares that frame's
+    stamp; equal stamps mean "same frame, re-render, do not step the simulation."
+
+    THIS IS THE THING THE WINDOWS BACKEND MUST FEED. Two obligations fall out:
+      (a) query the true refresh period -> set_period_fs()
+      (b) learn how many refresh periods actually elapsed between presents ->
+          display_tick(frames)
+    Getting (b) wrong is what makes animation stutter, and it is exactly what GDI
+    cannot tell you. See section 8.
+
+1.3 BUFFERS
+    Square power-of-two shared-memory buffers, keyed (gen << 1 | idx), with
+    Core::busy: [AtomicBool; 2] tracking which the server still holds, and
+    Core::in_flight counting presents submitted but not yet completed.
+
+1.4 INPUT
+    Canonical code space is evdev — the KEY_* / BTN_* constants at the top of
+    event.rs are Linux input event codes, and Buttons::bits is an absolute 512-bit
+    snapshot in that space. Text is resolved pump-side, layout-aware, with dead-key
+    composition (dead_sym, MODE_DEAD_KEY) and WM-driven autorepeat
+    (repeat_arm/repeat_tick). keysym_table.rs is an X11 keysym -> Unicode table.
+
+    Note the deliberate design in Core::key_press_sym(): copy/cut/paste is decided
+    by the CHARACTER a key produces, not its position, so it follows the layout.
+    Any Windows implementation must preserve that.
+
+1.5 AXES
+    24.8 fixed pixels for pointer and scroll, 16.16 for zoom and rotate. Pointer
+    position is also published on every RENDER. AXIS_ZOOM and AXIS_ROTATE come
+    from touchpad valuators via XI2 on Linux — remember this, it is a genuine
+    problem on Windows (section 11.6).
+
+1.6 WAITING
+    Core::wait() is a futex on head_futex with a `sleeping` flag to avoid the
+    syscall when nobody is asleep. Windows has no futex; see 10.3.
+
+
+================================================================================
+2. CONSTRAINT: RUST'S OWN WINDOWS FLOOR
+================================================================================
+
+2.1 THE SITUATION
+    rust-toolchain.toml pins 1.94.0 exactly, deliberately, with a comment saying
+    the exact version IS the stability guarantee. Rust's std raised its minimum
+    supported Windows to Windows 10 (believed 1.78 — VERIFY, see 17.1). The
+    tier-1 targets x86_64-pc-windows-msvc and i686-pc-windows-msvc therefore will
+    not run on Windows 7 or 8.x.
+
+    This directly contradicts the original "as many Windows versions as possible"
+    goal, and it is better to confront it now than to discover it after writing a
+    GDI backend for compatibility reasons that do not apply.
+
+2.2 WHY THIS IS LESS PAINFUL THAN IT SOUNDS
+    Windows 7 is out of support and its remaining desktop share is low single
+    digits at best. Windows 8.x is a rounding error. A Windows 10 floor reaches
+    effectively the entire real install base. And — this is the happy part — every
+    API this design actually wants (flip-model swapchains, waitable swapchain
+    objects, WaitOnAddress, per-monitor DPI v2, high-resolution waitable timers)
+    is Windows 8 or Windows 10 era. The compatibility ambition and the quality
+    ambition were in direct conflict; the toolchain resolved it in favor of
+    quality. Take the win.
+
+2.3 THE OPTIONS, IF THE FLOOR MATTERS
+    (a) Windows 10 floor. Standard tier-1 target, std available, everything in
+        this document works. STRONGLY RECOMMENDED DEFAULT.
+    (b) Windows 7 floor. Tier-3 targets x86_64-win7-windows-msvc /
+        i686-win7-windows-msvc. Tier 3 means no prebuilt std — you need
+        -Z build-std and therefore a nightly toolchain, which fights the pinned-
+        stable policy in rust-toolchain.toml. Costs the waitable swapchain object
+        and forces the DwmGetCompositionTimingInfo pacing path (8.5). Only worth
+        it if a specific user demands Windows 7.
+    (c) Anything older. Requires #![no_std] plus a hand-rolled panic handler,
+        allocator, and entry point, ANSI-only APIs, and a PE subsystem version of
+        4.0 that the modern linker will not emit without help. This is a project,
+        not a task. Do not do it unless the whole point is to do it.
+
+2.4 32-BIT VS 64-BIT
+    If maximum reach ever matters again, note that a 32-bit x86 binary runs on
+    64-bit Windows via WOW64 and on ARM64 Windows via emulation, so i686 is the
+    single most portable Windows target. Against that: 32-bit caps the address
+    space, which matters when a 4096x4096 buffer is 64 MiB and you might want
+    several. Default to x86_64-pc-windows-msvc; add aarch64-pc-windows-msvc when
+    someone asks. i686 only for a reach argument that has actually been made.
+
+
+================================================================================
+3. CONSTRAINT: NO STABLE SYSCALL ABI
+================================================================================
+
+3.1 THE FACT
+    src/sys.rs issues Linux syscalls directly through `asm!("syscall")` with
+    hardcoded numbers, and this is completely correct on Linux: the kernel ABI is
+    a stability contract, so numbers never change and no libc is required. This is
+    what makes the static musl binary honest.
+
+    Windows has no such contract. The ntdll Nt*/Zw* stubs are the syscall layer,
+    their numbers are an implementation detail of each ntdll build, and they DO
+    change across Windows versions and updates. Microsoft's supported boundary is
+    the documented DLL export. Hardcoding syscall numbers on Windows is not
+    "closer to the metal," it is a program that breaks on Patch Tuesday.
+
+3.2 WHAT THIS MEANS STRUCTURALLY
+    The Windows backend imports functions from DLLs. There is no alternative and
+    no cleverness available. Practically:
+
+       #[link(name = "kernel32")]
+       unsafe extern "system" {
+          fn CreateFileMappingW(h: isize, sa: *mut u8, protect: u32,
+                                hi: u32, lo: u32, name: *const u16) -> isize;
+          fn MapViewOfFile(h: isize, access: u32, off_hi: u32, off_lo: u32,
+                           bytes: usize) -> *mut u8;
+          // ...
+       }
+
+    Import libraries (kernel32.lib etc.) ship with the Windows SDK for the MSVC
+    toolchain and with the mingw-w64 runtime for the GNU toolchain. Rust resolves
+    #[link(name = "kernel32")] against them with no crate involved.
+
+3.3 SO src/sys.rs DOES NOT GET A #[cfg] BRANCH
+    Do not try to make sys.rs dual-platform. The Linux file's entire organizing
+    idea — a syscall number table and a syscall6() trampoline — has no Windows
+    counterpart. Write src/sys_win.rs as its own thing, and let the two files be
+    siblings selected by #[cfg(target_os)] at the module declaration in lib.rs.
+    The abstraction boundary belongs above sys, not inside it.
+
+
+================================================================================
+4. THE ZERO-DEPENDENCY RULE ON WINDOWS
+================================================================================
+
+4.1 THE RULE
+    From the project's hard rule: ZERO crate dependencies, not even -sys or
+    binding crates. On Linux that meant hand-writing X11 and Wayland wire
+    protocols. On Windows it means NO `windows-sys`, NO `windows`, NO `winapi`.
+
+4.2 WHY THIS IS EASIER ON WINDOWS THAN IT WAS ON LINUX
+    Genuinely, it is. On Linux you had to implement wire protocols: byte layouts,
+    request opcodes, sequence numbers, fd passing over SCM_RIGHTS, .Xauthority
+    parsing. On Windows the ABI is just the C calling convention. Declaring
+    `unsafe extern "system" fn MessageBoxW(...)` is a one-line transcription of a
+    documented signature. `windows-sys` is nothing but a very large pile of such
+    transcriptions plus build tooling; writing the fifty you need is an afternoon,
+    and the result is more readable than the crate because it contains only what
+    the project uses.
+
+4.3 COM WITHOUT A BINDING CRATE
+    D3D11 and DXGI are COM, which sounds like the hard part and is not. A COM
+    object is a pointer to a pointer to a vtable of `extern "system"` functions
+    whose first parameter is the object pointer. In Rust:
+
+       #[repr(C)]
+       struct IDXGISwapChainVtbl {
+          // --- IUnknown ---
+          query_interface: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32,
+          add_ref:         unsafe extern "system" fn(*mut c_void) -> u32,
+          release:         unsafe extern "system" fn(*mut c_void) -> u32,
+          // --- IDXGIObject, IDXGIDeviceSubObject omitted for brevity ---
+          // --- IDXGISwapChain ---
+          present:         unsafe extern "system" fn(*mut c_void, u32, u32) -> i32,
+          get_buffer:      unsafe extern "system" fn(*mut c_void, u32, *const Guid, *mut *mut c_void) -> i32,
+          // ...
+       }
+
+       #[repr(C)]
+       struct IDXGISwapChain { vtbl: *const IDXGISwapChainVtbl }
+
+       #[inline]
+       unsafe fn present(sc: *mut IDXGISwapChain, sync: u32, flags: u32) -> i32 {
+          unsafe { ((*(*sc).vtbl).present)(sc as *mut c_void, sync, flags) }
+       }
+
+    THE ONE RULE THAT WILL BITE YOU: vtable entries must be declared in exact
+    interface order, INCLUDING every inherited method from every base interface,
+    with none omitted. A missing or reordered entry is not a compile error — it is
+    a call to the wrong function pointer at runtime, which will look like an
+    inexplicable crash or, worse, silent nonsense. Transcribe from the SDK headers
+    (d3d11.h, dxgi.h, dxgi1_2.h, dxgi1_3.h) methodically and comment each vtable
+    with which interface each block came from. If you do this carelessly you will
+    lose a day; if you do it carefully it is boring and works.
+
+    Also needed:
+      - GUIDs as #[repr(C)] structs, transcribed from the headers, for
+        QueryInterface and for GetBuffer's riid parameter.
+      - HRESULT is i32; negative means failure. Check every single one.
+      - Release() on everything, in reverse creation order. Rust has no RAII help
+        here unless you write a Drop impl, and per the project's style guide a
+        thin explicit release at a known teardown point is more in keeping than a
+        smart pointer.
+
+4.4 D3D COMPILER — AVOID IT
+    The fullscreen-quad draw needs a vertex and pixel shader. Do NOT call
+    D3DCompile at runtime: it lives in d3dcompiler_47.dll, which is a redistributable
+    that may not be present, and shipping it is a dependency by another name.
+    Instead compile the two trivial shaders ONCE with fxc.exe offline and embed the
+    resulting DXBC bytecode with include_bytes!. The shaders are a handful of lines
+    and will never change. This keeps the binary self-contained, which is the whole
+    point of the project.
+
+    (Even simpler alternative that skips shaders entirely: see 5.3.4.)
+
+
+================================================================================
+5. PRESENTATION: THE OPTION SPACE
+================================================================================
+
+Four ways to get a CPU buffer onto a Windows screen, in ascending order of
+setup cost and descending order of pain later.
+
+--------------------------------------------------------------------------------
+5.1 GDI, DIB SECTION OVER A FILE MAPPING
+--------------------------------------------------------------------------------
+
+The most interesting GDI path, and the one that maps closest to the Linux shm
+model, so it deserves a full description even though it is not recommended.
+
+CreateDIBSection has an hSection parameter that almost nobody uses:
+
+   HBITMAP CreateDIBSection(HDC hdc, const BITMAPINFO *bmi, UINT usage,
+                            void **ppvBits, HANDLE hSection, DWORD dwOffset);
+
+Pass a handle from CreateFileMappingW(INVALID_HANDLE_VALUE, ...) — i.e.
+pagefile-backed shared memory — plus an offset, and GDI constructs its bitmap
+object directly on top of your shared pages. From one call you get:
+
+   - a void* you rasterize into as a flat *mut u32,
+   - a real HBITMAP you can SelectObject into a memory DC and BitBlt from, which
+     is GDI's fast path (not the StretchDIBits re-validate-the-BITMAPINFO-every-
+     call path),
+   - pixels living in a named section that any other process can MapViewOfFile.
+
+dwOffset must be a multiple of 4 (DWORD-aligned storage). Two CreateDIBSection
+calls at two offsets into one mapping put both buffers in one contiguous shared
+region, which is exactly the Linux layout.
+
+Suggested region layout if this path is ever used:
+
+   offset 0                : Shared_Header  (64 KiB — one allocation granule,
+                                             keeps the buffers page-aligned)
+   offset 64K              : buffer A       (N*N*4)
+   offset 64K + N*N*4      : buffer B       (N*N*4)
+
+   #[repr(C)]
+   struct Shared_Header {
+      magic:         u32,
+      version:       u32,
+      dim:           u32,   // N, power of two
+      front_index:   u32,   // 0 or 1 — buffer holding the last completed frame
+      frame_counter: u32,   // volatile; bumped after front_index is published
+      pad:           [u32; 11],
+   }
+
+Reader protocol for a second process: read frame_counter, read front_index,
+consume that buffer, re-read frame_counter. Unchanged means the front buffer did
+not flip underneath you. No mutex, no kernel transition. On x86/x64 (store-
+ordered) aligned volatile u32 accesses plus a compiler fence give the needed
+release/acquire; on aarch64-pc-windows-msvc you need real atomics with Release/
+Acquire ordering, so just use core::sync::atomic and stop thinking about it.
+
+GDI gotchas worth recording:
+   - Negative biHeight for a top-down DIB. Otherwise row 0 is the bottom and
+     every loop you write is upside down.
+   - 32bpp, BI_RGB, BGRX in memory. Any other format makes GDI convert per blit.
+   - SetDIBitsToDevice beats StretchDIBits when not scaling; it skips the stretch
+     path entirely.
+   - GDI batches calls. GdiFlush(), or GdiSetBatchLimit(1), if you need a blit to
+     have actually happened before you touch the source pixels again.
+   - Under DWM your blit lands in a redirection surface which DWM then composites,
+     so you pay roughly two copies.
+
+WHY IT IS STILL NOT THE ANSWER: GDI provides no timing information whatsoever, at
+any Windows version. No vblank signal, no refresh period, no present count. You
+cannot build Core's display clock on it. DwmFlush() (Vista+) blocks until the
+compositor's next present and gets you crude pacing, but it tells you nothing
+about how many refresh periods elapsed, which is precisely what display_tick()
+needs. A GDI backend would silently lose the one property this crate exists for.
+
+--------------------------------------------------------------------------------
+5.2 GDI, StretchDIBits / SetDIBitsToDevice DIRECTLY
+--------------------------------------------------------------------------------
+
+The 15-line version: VirtualAlloc a buffer, fill a BITMAPINFO with negative
+height, StretchDIBits it in WM_PAINT. Worth knowing because it is the fastest
+possible way to get SOMETHING on screen, which makes it a legitimate scaffold
+while you are bringing up input and the event ring. Delete it once D3D11 works.
+Same fatal flaw as 5.1: no timing.
+
+--------------------------------------------------------------------------------
+5.3 D3D11 + DXGI FLIP-MODEL SWAPCHAIN  <<< THE RECOMMENDATION
+--------------------------------------------------------------------------------
+
+5.3.1 SETUP SKETCH
+
+   D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, flags,
+                     feature_levels, n, D3D11_SDK_VERSION,
+                     &device, &obtained_level, &context);
+
+   // Walk to the factory: device -> IDXGIDevice -> GetAdapter -> GetParent(IDXGIFactory2)
+   // (Do not use CreateDXGIFactory directly with a device from another factory.)
+
+   DXGI_SWAP_CHAIN_DESC1 desc = {
+      .Width  = 0,                                  // 0 = match the HWND client area
+      .Height = 0,
+      .Format = DXGI_FORMAT_B8G8R8A8_UNORM,         // matches BGRX; see 5.3.3
+      .SampleDesc = { 1, 0 },
+      .BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT,
+      .BufferCount = 2,                             // flip model requires >= 2
+      .Scaling = DXGI_SCALING_NONE,
+      .SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD,  // Win10+; FLIP_SEQUENTIAL on Win8
+      .AlphaMode = DXGI_ALPHA_MODE_IGNORE,
+      .Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
+   };
+   IDXGIFactory2::CreateSwapChainForHwnd(device, hwnd, &desc, NULL, NULL, &swapchain);
+
+   // Stop DXGI from hijacking Alt+Enter into its own fullscreen transition.
+   IDXGIFactory2::MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+
+   // The pacing handle. See section 8.
+   IDXGISwapChain2::SetMaximumFrameLatency(1);
+   HANDLE waitable = IDXGISwapChain2::GetFrameLatencyWaitableObject();
+
+5.3.2 THE PERSISTENT TEXTURE — THE PART THAT FITS THIS PROJECT WELL
+
+   Create ONE D3D11_USAGE_DEFAULT texture of N x N, matching the CPU buffer, with
+   D3D11_BIND_SHADER_RESOURCE. It persists across frames. Each frame you upload
+   only the damaged region:
+
+      let box = D3D11_BOX { left: x0, top: y0, front: 0,
+                            right: x1, bottom: y1, back: 1 };
+      UpdateSubresource(ctx, tex, 0, &box,
+                        cpu_buf.add(((y0 as usize) << LOG2_N) + x0 as usize) as *const _,
+                        (N * 4) as u32,   // source row pitch = full buffer pitch
+                        0);
+
+   Then draw the fullscreen quad and Present(1, 0).
+
+   This is the shape that matches the stated requirement exactly: damage never
+   leaves the process, the compositor receives a complete frame every time, and
+   you still skip uploading the 95% of a 2048x2048 buffer that did not change.
+   The u64-per-tile-row dirty masks from section 7 feed the box directly, either
+   as one bounding box or as one UpdateSubresource per coalesced run.
+
+   NOTE ON pSrcData: when a box is supplied, the pointer must address the first
+   pixel OF THE BOX, not the origin of the buffer, while SrcRowPitch remains the
+   FULL buffer pitch. Getting this backwards produces a diagonal-smear artifact
+   that is instantly recognizable once you have seen it once.
+
+5.3.3 WHAT NOT TO DO: Map WITH D3D11_MAP_WRITE_DISCARD
+
+   The reflexive idiom for CPU-updated textures is a D3D11_USAGE_DYNAMIC texture
+   with Map(WRITE_DISCARD) / memcpy / Unmap. Do not use it here. WRITE_DISCARD
+   hands you a FRESH buffer every frame with undefined contents, which forces a
+   full-frame memcpy (16 MiB at 2048x2048, on the order of a millisecond or two of
+   pure memory traffic) and throws away precisely the incremental property you
+   are trying to preserve. It is the right idiom for a renderer that regenerates
+   everything each frame. It is the wrong idiom for this one.
+
+   D3D11_MAP_WRITE without DISCARD on a dynamic resource permits partial updates
+   but can stall the pipeline waiting for the GPU to finish with the resource.
+   UpdateSubresource on a DEFAULT resource lets the runtime handle the hazard
+   (typically by staging internally) and is the correct choice.
+
+5.3.4 THE COPY-INSTEAD-OF-DRAW SHORTCUT
+
+   If you would rather not ship shaders at all: make the texture the same format
+   and size as the swapchain backbuffer and use CopyResource (or
+   CopySubresourceRegion) from your texture straight into the backbuffer, then
+   Present. No vertex buffer, no shaders, no input layout, no d3dcompiler.
+
+   The cost is that you lose free GPU scaling — the texture must then match the
+   window size rather than being a fixed power-of-two — which collides with the
+   square-power-of-two buffer requirement. So: use CopyResource for a fast bring-
+   up, then switch to the quad once you want a fixed N x N buffer scaled or
+   letterboxed into an arbitrary window. Plan for the quad; it is ~40 lines and
+   two tiny precompiled shaders.
+
+5.3.5 WHY THIS PATH AND NOT ANOTHER
+
+   - It is the only Windows path that reports vblank-accurate present statistics
+     in windowed mode (section 8).
+   - Flip model bypasses the DWM redirection-surface copy, so it is also the
+     fastest.
+   - It gives real, tear-free vsync via Present(1, 0), and optional tearing via
+     DXGI_PRESENT_ALLOW_TEARING for a future uncapped mode.
+   - Feature level 9_1 is sufficient; this works on ancient GPUs.
+   - D3D_DRIVER_TYPE_WARP gives a fully software rasterizer fallback for VMs and
+     broken drivers, with the identical code path above it. Try HARDWARE, fall
+     back to WARP, and log which you got.
+
+--------------------------------------------------------------------------------
+5.4 D3D9Ex — ONLY IF THE FLOOR DROPS TO WINDOWS 7
+--------------------------------------------------------------------------------
+
+Mentioned for completeness. On Vista/7, D3D9Ex with D3DSWAPEFFECT_FLIPEX plus
+IDirect3DDevice9Ex::GetPresentStatistics gives a present-count/QPC pair
+comparable to DXGI's. It is only relevant under option 2.3(b), and 2.3(b) is
+already a nightly-toolchain fight. Recorded so a future reader knows it exists
+and does not have to rediscover it.
+
+--------------------------------------------------------------------------------
+5.5 WHAT WE DO NOT GET, RESTATED
+--------------------------------------------------------------------------------
+
+There is no Windows equivalent of handing the compositor your shm pages. Not via
+DIB sections, not via D3D11, not via DirectComposition. DWM composites from GPU
+surfaces it owns. One mandatory CPU->GPU copy per frame. This is a structural
+difference from both Linux backends, not a gap in the research, and it should be
+stated plainly in the eventual module doc comment so nobody goes looking.
+
+
+================================================================================
+6. BUFFER COUNT: WHY WINDOWS WANTS ONE CPU BUFFER
+================================================================================
+
+This section exists because the instinct to mirror the Linux design here is
+strong and wrong. It is worth the space.
+
+6.1 WHY LINUX NEEDS TWO
+    On Wayland the compositor holds your wl_buffer until it sends release. On X11
+    with Present the server holds the pixmap until PresentCompleteNotify. In both
+    cases touching the buffer you just presented is a correctness bug — you would
+    be drawing into pixels being scanned out. Hence two buffers, hence
+    Core::busy[2], hence the (gen << 1 | idx) key so completion events can be
+    matched to the buffer they refer to.
+
+6.2 WHY WINDOWS DOES NOT
+    Every Windows path copies your pixels out synchronously from your buffer's
+    point of view. UpdateSubresource reads your memory and returns; the data is
+    the runtime's problem afterwards. BitBlt copies into the redirection surface
+    and returns. Your buffer is yours again the instant the call returns. There is
+    nothing to wait for and nothing to track.
+
+    The swapchain has its own 2-3 backbuffers, but those are GPU-side and DXGI
+    manages them. They are not your CPU buffers and they do not need mirroring in
+    your data structures.
+
+6.3 THE COST OF KEEPING TWO ANYWAY — THE N-2 PROBLEM
+    This is the actual argument, and it is a correctness trap rather than a
+    performance nit.
+
+    With two buffers alternating, the buffer you are about to render frame N into
+    most recently held frame N-2, not N-1. If your renderer is incremental — only
+    touching what changed since last frame, which is the entire premise — then
+    regions that changed during frame N-1 still hold their N-2 pixels in this
+    buffer, and you will not redraw them because they did not change during
+    frame N. Result: stale rectangles that flicker between two states on alternate
+    frames. It is a maddening bug to diagnose from the symptom.
+
+    The fix, if you keep two buffers, is to render the union of the last two
+    damage masks:
+
+       // buffer holds frame N-2; to make it correct for frame N we must repaint
+       // everything that changed across BOTH intervening frames.
+       for i in 0..TILE_ROWS {
+          must_render[i] = damage_this_frame[i] | damage_prev_frame[i];
+       }
+
+    With ONE buffer the buffer holds frame N-1 and must_render is simply this
+    frame's damage. No union, no prev_damage array, no class of bug.
+
+6.4 RECOMMENDATION
+    One CPU buffer on Windows. If backend uniformity in the shared code matters,
+    keep the (gen << 1 | idx) key and pin idx = 0, so callers see one interface
+    while the Windows backend is honest about there being nothing to alternate.
+    Core::busy[2] and Core::in_flight become no-ops on Windows: busy is never set,
+    in_flight is never incremented, and the pacing signal comes from the waitable
+    object instead (section 8.3). Document that in the Windows module header, or
+    the next reader will assume the fields are simply unimplemented.
+
+6.5 THE ONE CAVEAT
+    If you ever add a render thread separate from both the pump and the app
+    thread, and it can begin frame N+1 while frame N's UpdateSubresource is still
+    in flight, the reasoning above stops holding and you want two buffers again
+    for the ordinary producer/consumer reason. That is not the current
+    architecture. Revisit if it becomes one.
+
+
+================================================================================
+7. DIFFED RENDERING, INTERNAL ONLY
+================================================================================
+
+7.1 THE SCOPE, PER THE REQUIREMENT AS STATED
+    The compositor gets complete frame buffers. Damage tracking exists purely so
+    the APP can skip re-rendering unchanged regions, and secondarily so the upload
+    can skip unchanged bytes (5.3.2). Nothing about damage is ever communicated to
+    Windows.
+
+    THIS DELETES A LOT OF MACHINERY that a damage-aware presentation path would
+    need: no back-versus-front tile compare pass, no presentation mask, no rect
+    coalescing into a BitBlt list, no DXGI_PRESENT_PARAMETERS dirty rects. Only
+    the render mask survives. If you find yourself writing a memcmp over two
+    buffers, stop — that was for telling the compositor, and we are not doing that.
+
+7.2 TILE MASKS — WHY POWER-OF-TWO SQUARE PAYS OFF
+    With N a power of two and 32x32 tiles, the tile grid is (N/32) x (N/32). At
+    N = 2048 that is 64 x 64, which is EXACTLY one u64 per tile row:
+
+       // bit t of dirty[r] == tile (t, r) is dirty
+       dirty: [u64; N / 32]
+
+    512 bytes of bookkeeping for a 16 MiB buffer. Addressing is shifts throughout:
+
+       pixel     = base + (y << LOG2_N) + x
+       tile_base = (ty << (LOG2_N + 5)) + (tx << 5)
+
+    Coalescing dirty tiles into rectangles becomes bit twiddling rather than
+    geometry: per row, trailing_zeros() for the run start, complement and scan
+    again for the run end, emit, clear, repeat; then merge vertically adjacent
+    rows whose masks are equal. Rust gives you u64::trailing_zeros() and
+    u64::leading_zeros() as intrinsics. A few dozen lines, no allocation, no
+    sorting.
+
+7.3 THE ONE REAL COST OF A POWER-OF-TWO PITCH
+    State it in a comment where the buffer is allocated, because it will
+    eventually confuse someone profiling.
+
+    A power-of-two pitch is the worst case for L1 cache set aliasing. At N = 2048
+    the pitch is 8192 bytes, so consecutive rows in a COLUMN walk land in the same
+    cache set, and a vertical traversal thrashes an 8-way L1 after 8 rows.
+
+      - Row-major rasterization: unaffected. This is what you will be doing.
+      - The tiled upload: unaffected. A 32x32 tile touches only 32 rows.
+      - A column-major pass (vertical blur, transpose, some scalers): pathological.
+        The profiler will point at memory and you will not immediately see why.
+
+    The classic fix — pad the pitch by one cache line — is exactly what the
+    power-of-two requirement gives up. The mitigation available here is to work in
+    tiles for anything that is not row-major. Given tiles are already the damage
+    granularity, this is not extra structure, just discipline.
+
+7.4 WHO OWNS THE MASK
+    Open question for the API: does the app declare damage explicitly (a
+    `damage(x, y, w, h)` call it makes while drawing), or does softer_gui infer
+    it? Explicit is cheaper and fits the project's explicit-over-implicit
+    philosophy. It also means a buggy app can under-report and get stale pixels,
+    with a `full_redraw` escape hatch — and note Core::full_redraw already exists
+    in event.rs, which suggests the intended answer is explicit with an override.
+    Resolve before designing the public surface.
+
+
+================================================================================
+8. PACING — THE ACTUAL HARD PART
+================================================================================
+
+This is the section that matters. Everything above is plumbing; this is where a
+Windows backend either reproduces the crate's central property or quietly fails
+to.
+
+8.1 WHAT MUST BE PRODUCED
+    Two things, restating 1.2:
+      (a) disp_period_fs — the true nominal refresh period, in femtoseconds.
+      (b) the `frames` argument to display_tick() — how many whole refresh
+          periods elapsed since the last frame boundary. Normally 1. It is 2 when
+          a frame was missed, and getting that right instead of always passing 1
+          is the difference between animation that stays locked to the display and
+          animation that slowly drifts and hitches.
+
+8.2 WHAT X11 PRESENT GAVE US, FOR COMPARISON
+    PresentCompleteNotify carries msc (a monotonically increasing frame counter)
+    and ust (the timestamp of that frame). Delta of msc between completions IS the
+    `frames` value, directly, with no inference. Wayland's frame callback gives a
+    weaker signal — "a frame boundary happened" — with the period obtained
+    separately from the output mode.
+
+8.3 THE PRIMARY WINDOWS MECHANISM: THE WAITABLE SWAPCHAIN OBJECT
+    Create the swapchain with DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
+    call SetMaximumFrameLatency(1), and get the handle with
+    GetFrameLatencyWaitableObject(). The handle becomes signalled when the
+    swapchain is ready to accept another frame — that is, DXGI is telling you when
+    to start rendering so your frame lands on the next vblank rather than sitting
+    in a queue.
+
+    Loop shape:
+
+       wait on `waitable`        // "start now to hit the next vblank"
+       push RENDER into the ring // app draws
+       upload damage, draw quad
+       Present(1, 0)
+
+    This is the closest Windows gets to "wake me at the right moment," and it is
+    a genuinely good signal — better than sleeping on a timer and guessing.
+    IDXGISwapChain2 is Windows 8.1+; under the Windows 10 floor it is always
+    available.
+
+8.4 THE COUNTING MECHANISM: DXGI_FRAME_STATISTICS
+    IDXGISwapChain::GetFrameStatistics fills:
+
+       PresentCount        — presents this swapchain has completed
+       PresentRefreshCount — the refresh count at which the last present was shown
+       SyncRefreshCount    — refresh count at the last v-sync the runtime sampled
+       SyncQPCTime         — QPC timestamp of that v-sync
+       SyncGPUTime         — GPU timestamp (rarely useful here)
+
+    PresentRefreshCount IS the MSC analog. SyncQPCTime IS the UST analog. So:
+
+       frames = new.PresentRefreshCount - old.PresentRefreshCount;
+       if frames == 0 { frames = 1; }   // stats not yet updated; do not stall the clock
+       core.display_tick(frames);
+
+    Two important caveats, both of which will cost you time if unknown:
+
+      (a) In WINDOWED mode, GetFrameStatistics is only supported for FLIP-MODEL
+          swapchains. On a legacy blt-model windowed swapchain it fails. This is
+          another reason the flip model is not optional here.
+      (b) It can return DXGI_ERROR_FRAME_STATISTICS_DISJOINT, meaning the counters
+          discontinued (mode change, fullscreen transition, driver reset). Treat
+          it as "resynchronize": re-read as the new baseline, tick by 1 for that
+          frame, and carry on. Do not propagate the discontinuity into disp_fs.
+
+    Also expect PresentCount to lag and stats to be unavailable for the first few
+    frames after creation. Guard the whole thing.
+
+8.5 THE REFRESH PERIOD: DwmGetCompositionTimingInfo
+    For disp_period_fs you want the nominal period, not a measurement. Options:
+
+      (a) DwmGetCompositionTimingInfo (Vista+) fills DWM_TIMING_INFO with
+          qpcRefreshPeriod (period in QPC units) and rateRefresh (an exact
+          rational, numerator/denominator — better, because 59.94 Hz is not
+          59.94 Hz). Convert the rational to femtoseconds directly and avoid ever
+          round-tripping through a float.
+          Pass NULL for the HWND; per-window queries were removed in Windows 8
+          (VERIFY — 17.6).
+      (b) EnumDisplaySettingsW / DEVMODE.dmDisplayFrequency gives an integer Hz,
+          which is coarse (reports 59 for 59.94) and not good enough alone.
+      (c) IDXGIOutput::GetDisplayModeList / DXGI_MODE_DESC.RefreshRate is also an
+          exact rational and is the natural fit if you already have the output
+          from the swapchain's adapter. Arguably cleaner than (a) since it needs
+          no dwmapi import.
+
+    RECOMMENDATION: (c) if the DXGI plumbing is already there, (a) as a cross-
+    check. Convert exactly:
+
+       // rate is Numerator/Denominator Hz; period = Denominator/Numerator seconds.
+       let period_fs = 1_000_000_000_000_000u64 * den as u64 / num as u64;
+       core.set_period_fs(period_fs);
+
+    Re-query on WM_DISPLAYCHANGE and after any DXGI_ERROR_FRAME_STATISTICS_DISJOINT
+    — users do change refresh rates, and variable-refresh displays exist.
+
+8.6 THE COMBINED WAIT — THE ONE PRIMITIVE THAT MAKES THE PUMP WORK
+    The pump thread must simultaneously wait for (i) the swapchain waitable
+    object, (ii) window messages, and possibly (iii) other handles. A plain
+    WaitForMultipleObjects does NOT wake for messages. The primitive you want is:
+
+       MsgWaitForMultipleObjectsEx(1, &waitable, timeout_ms,
+                                   QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+
+    MWMO_INPUTAVAILABLE matters: without it there is a race where a message
+    arrives and is marked "already seen" between your PeekMessage drain and your
+    wait, and you sleep through it. This is a classic Win32 pitfall and it
+    manifests as an occasionally unresponsive window, which is the worst kind of
+    bug to chase. Set the flag.
+
+    This function is the structural analog of poll() in the Linux pump loop, and
+    the timeout argument is where repeat_tick()'s returned millisecond value goes
+    — Core::repeat_tick() already returns exactly the ms-until-next-autorepeat
+    that this parameter wants, clamped to 100. That fits with no adaptation.
+
+8.7 TIMER RESOLUTION, IF YOU EVER SLEEP
+    Prefer never sleeping on a timer — the waitable object is a better signal. If
+    you must (unfocused throttling, an idle path), note that the default timer
+    granularity is ~15.6 ms. timeBeginPeriod(1) (winmm) raises it globally and is
+    frowned upon; CreateWaitableTimerExW with
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Windows 10 1803+) is the modern,
+    process-local, correct answer.
+
+8.8 VARIABLE REFRESH / MULTI-MONITOR
+    Two hazards to note now and handle later:
+      - A window dragged between monitors of different refresh rates must
+        re-query the period. WM_DISPLAYCHANGE does not fire for this; watch for
+        the swapchain's containing output changing, or poll cheaply on a window-
+        move message.
+      - With VRR active, "nominal refresh period" is a fiction and display_tick()'s
+        whole-periods-only model degrades. Out of scope for a first version, but
+        write down in the module header that it is a known limitation rather than
+        letting a future reader think it is a bug.
+
+
+================================================================================
+9. SHARED MEMORY: WHAT IT IS STILL FOR
+================================================================================
+
+The Linux design's shm buffers served two purposes at once: cross-process sharing
+AND the zero-copy compositor handoff. On Windows the second purpose evaporates
+(0.3, 5.5). The first survives intact if it is wanted.
+
+If a second process of yours needs to read the framebuffer — a recorder, an
+inspector, an out-of-process renderer — CreateFileMappingW/MapViewOfFile plus the
+Shared_Header protocol in 5.1 still works, and works with D3D11 just as well as
+with GDI: your CPU buffer simply lives in the mapping instead of in a private
+allocation, and UpdateSubresource reads from it either way. The cost is zero.
+
+If nothing else reads it, a plain allocation is simpler and the mapping is
+ceremony. Note that MapViewOfFile has 64 KiB allocation granularity (query it
+with GetSystemInfo, do not hardcode it) which is why the header block in 5.1 is
+sized that way.
+
+OPEN QUESTION carried forward to section 16: was the shm in the Linux design
+there for the compositor handoff, for a second process, or both? The answer
+decides whether this section is load-bearing or deletable.
+
+
+================================================================================
+10. THE EVENT PUMP AND THREADING MODEL
+================================================================================
+
+10.1 MESSAGE QUEUE THREAD AFFINITY — A REAL CONSTRAINT
+     Win32 message queues are per-thread, and a window belongs to the thread that
+     created it. Its messages are delivered ONLY to that thread, and that thread
+     must keep pumping or the window stops responding (Windows will eventually
+     draw the ghost "Not Responding" frame over it).
+
+     This maps well onto the existing pump-thread/app-thread split: the pump
+     thread creates the HWND, owns the message loop, and is the sole producer into
+     the ring — exactly its role on Linux. The app thread never touches the HWND.
+
+     CONSEQUENCE FOR THE PUBLIC API: some operations (window creation, resize,
+     fullscreen, setting the title, showing/hiding the cursor) must execute ON the
+     pump thread. The existing design already anticipates this with request flags
+     the app sets and the pump acts on — Core::wants_fullscreen, cursor_hidden,
+     title_changed. Keep that pattern; do not add a Windows API that the app
+     thread calls directly. PostMessage is the escape hatch for anything that
+     needs to be a request rather than a flag.
+
+10.2 DEVICE AND SWAPCHAIN OWNERSHIP
+     D3D11 devices are free-threaded by default, but the immediate context is NOT.
+     Decide explicitly which thread owns the immediate context and does the
+     upload/draw/Present, and stick to it. Simplest: the pump thread owns
+     everything, and the app thread only writes pixels into the CPU buffer. That
+     keeps all Windows and D3D state on one thread and the shared surface between
+     threads is just the ring plus the pixel buffer — which is exactly the Linux
+     arrangement, so the shared code above the backend does not need to know.
+
+10.3 THERE IS NO FUTEX — USE WaitOnAddress
+     Core::wait() futexes on head_futex. The Windows equivalent is:
+
+        WaitOnAddress(addr, compare_addr, size, timeout_ms)   // Windows 8+
+        WakeByAddressSingle(addr)
+        WakeByAddressAll(addr)
+
+     Exported from API-MS-Win-Core-Synch-l1-2-0.dll; link against synchronization.lib
+     (MSVC) — note that #[link(name = "synchronization")] is the right spelling,
+     NOT kernel32. Semantics match futex closely enough that Core::wait() and
+     Core::commit() port almost mechanically: WaitOnAddress compares the value at
+     the address against a comparand you supply and sleeps only if they are equal,
+     which is the same race-avoidance dance the futex code is already doing with
+     the `seen` snapshot.
+
+     The `sleeping` flag optimization in Core::commit() — only call the wake
+     syscall when someone is actually asleep — transfers unchanged and is worth
+     just as much on Windows.
+
+     If the floor ever drops below Windows 8, fall back to a manual-reset event
+     per waiter. Under the Windows 10 floor, do not bother.
+
+10.4 THREAD CREATION
+     std::thread works on Windows targets; there is no reason to hand-roll
+     CreateThread. This is one of the places where having std is simply a gift and
+     the no-dependencies rule imposes no cost.
+
+
+================================================================================
+11. INPUT MAPPING — THE OTHER HALF OF THE PORT
+================================================================================
+
+Covered more thinly than sections 5-8 because the research conversation focused
+on rendering. Treat this as a map of the terrain and expect each subsection to
+expand into real work.
+
+11.1 THE CENTRAL MISMATCH: evdev CODES
+     event.rs's canonical code space is evdev (KEY_ESC = 1, KEY_ENTER = 28,
+     BTN_LEFT = 0x110, ...) and Buttons::bits is a 512-bit absolute snapshot in
+     that space. Windows gives you virtual-key codes plus a PS/2 set-1 scancode in
+     lParam bits 16-23, with bit 24 as the "extended" flag.
+
+     GOOD NEWS, AND IT IS BETTER NEWS THAN IT LOOKS: Linux evdev codes for the
+     main keyboard block are historically derived from set-1 scancodes, so a large
+     part of the mapping is close to identity, and the extended-flag keys (arrows,
+     navigation cluster, right-side modifiers, numpad Enter) are the ones needing
+     an explicit table. Build a static [u16; 256] for the non-extended range and a
+     second for the extended range, both plain checked-in const tables, not generated at build time. Follow the
+     precedent of keysym_table.rs: a big honest table, generated once, checked in.
+
+     DO NOT map from virtual-key codes. VK codes are layout-DEPENDENT for the
+     alphanumeric block, and the whole point of the evdev layer is that it is
+     positional. Map from the SCANCODE, always.
+
+11.2 TEXT: THREE OPTIONS, PICK ToUnicode
+     (a) WM_CHAR. Windows resolves layout and dead keys for you and hands you
+         UTF-16. Easy, but it arrives as a separate message from WM_KEYDOWN, which
+         makes it awkward to preserve the strict ordering guarantee that
+         key_press_sym() relies on (text before button snapshot before autorepeat
+         arming — the order is load-bearing and commented as such in event.rs).
+     (b) ToUnicode / ToUnicodeEx. Called from the WM_KEYDOWN handler with the
+         current keyboard state, returns the layout-resolved characters
+         synchronously, right where you need them. This preserves ordering and
+         fits key_press_sym()'s signature (code, sym, text, now_ns) almost exactly.
+         RECOMMENDED.
+         THE TRAP: ToUnicode has a side effect — it consumes and can modify the
+         kernel's dead-key state. Calling it speculatively, or twice for one key,
+         corrupts dead-key composition. There is a well-known workaround (call it
+         a second time to restore state, or use ToUnicodeEx with a scratch
+         keyboard layout). Budget real time for this; it is the fiddliest part of
+         Windows keyboard handling.
+     (c) MapVirtualKeyW(MAPVK_VK_TO_CHAR). No modifier context. Not sufficient.
+
+11.3 DEAD KEYS
+     event.rs implements dead-key composition itself (dead_sym, MODE_DEAD_KEY,
+     keysym::dead_key_base, keysym::dead_compose), because X11 hands you a raw
+     dead keysym. Windows composes dead keys inside ToUnicode and signals a
+     pending dead key by returning a NEGATIVE count.
+
+     DESIGN DECISION REQUIRED: either
+       (i) let Windows compose, and synthesize the MODE_DEAD_KEY flag from
+           ToUnicode's negative return so the app still sees the same state
+           machine — less code, native behaviour, but the composition tables are
+           Windows's rather than ours; or
+      (ii) suppress the OS composition and drive our own tables, for byte-identical
+           behaviour across platforms.
+     (i) is much less work and almost certainly right. Note the divergence in a
+     comment either way, because "the same accent produces a different character
+     on Windows" is otherwise a baffling bug report.
+
+11.4 KEYSYMS
+     keysym_table.rs is X11 keysyms. There is no keysym concept on Windows. Rather
+     than fabricating one, note that key_press_sym() uses `sym` for exactly three
+     things: keysym::is_modifier, keysym::dead_key_base, and keysym::to_char for
+     the ctrl+c/x/v layout-aware shortcut check. All three can be answered on
+     Windows without keysyms — modifier-ness from the scancode, dead-key state
+     from ToUnicode's return, and the shortcut character from the ToUnicode text
+     with modifiers stripped.
+
+     So: consider widening the shared interface slightly rather than synthesizing
+     fake keysyms on Windows. Whatever you do, PRESERVE the layout-aware
+     copy/cut/paste behaviour — on an AZERTY or Dvorak layout the shortcut must
+     follow the character, not the position. Getting this right on Windows means
+     calling ToUnicode with the Ctrl modifier cleared from the state array, since
+     Ctrl+C otherwise resolves to U+0003 rather than 'c'.
+
+11.5 AUTOREPEAT
+     event.rs deliberately drives autorepeat itself (repeat_arm / repeat_tick /
+     key_refire) with WM-supplied delay and interval, rather than trusting the
+     server's repeat events. Windows repeat parameters come from
+     SystemParametersInfoW with SPI_GETKEYBOARDDELAY (an index 0-3 mapping to
+     roughly 250/500/750/1000 ms) and SPI_GETKEYBOARDSPEED (0-31 mapping to
+     roughly 2.5-30 repeats/sec). Convert and feed Core::set_repeat(delay_ms,
+     interval_ms).
+
+     Windows also delivers its own repeated WM_KEYDOWNs with lParam bit 30 (the
+     "previous key state") set. IGNORE THOSE — filter them out, and let
+     repeat_tick() remain the single source of repeat. Two repeat engines running
+     at once is a doubled-input bug.
+
+     Refresh the parameters on WM_SETTINGCHANGE.
+
+11.6 POINTER, WHEEL, AND THE TOUCHPAD GAP
+     - Absolute position: WM_MOUSEMOVE gives client-relative integer pixels.
+       Core::pointer_abs() wants 32.32 fixed, so shift left by 32. Note the crate
+       carries sub-pixel precision it will not receive from this path.
+     - Raw/high-resolution motion: RegisterRawInputDevices + WM_INPUT (XP+) gives
+       unaccelerated deltas. Needed if a future feature wants pointer-lock or
+       raw look; not needed for a cursor.
+     - Wheel: WM_MOUSEWHEEL / WM_MOUSEHWHEEL, delta in multiples of WHEEL_DELTA
+       (120). One click maps to SCROLL_STEP (15 * 256 in 24.8). High-resolution
+       wheels send deltas smaller than 120 and MUST NOT be rounded to a click —
+       scale proportionally and accumulate the remainder, or precision scrolling
+       feels broken.
+     - Buttons: WM_LBUTTONDOWN/UP etc. -> BTN_LEFT/RIGHT/MIDDLE; WM_XBUTTONDOWN
+       carries which X button in the high word of wParam -> BTN_SIDE / BTN_EXTRA.
+       Remember SetCapture on press and ReleaseCapture on release, or a drag that
+       leaves the window silently stops reporting.
+
+     THE GAP — AXIS_ZOOM AND AXIS_ROTATE. On Linux these come from XI2 touchpad
+     valuators. Windows has no clean equivalent:
+       - WM_GESTURE (Win7) is legacy, touch-oriented, and largely superseded.
+       - Direct Manipulation (Win8+) is the sanctioned route for precision-
+         touchpad pan/zoom, and it is a COM-heavy, callback-driven, inversion-of-
+         control API that fits this project's style guide extremely badly (the
+         guide explicitly names required callbacks as a red flag).
+       - Precision Touchpads are HID devices and DO expose raw contacts via Raw
+         Input on HID usage page 0x0D. You can parse contacts yourself and compute
+         pinch and rotate from contact pairs — which is very much in the spirit of
+         hand-writing the X11 wire protocol, and gives behaviour matching the
+         Linux backend exactly.
+       - Or: ship without zoom/rotate on Windows initially and emit nothing on
+         those axes. The app already handles axes being absent.
+     RECOMMENDATION: ship without them first, then implement raw HID parsing.
+     Do not adopt Direct Manipulation.
+
+11.7 CLIPBOARD
+     Core emits CP_COPY/CP_CUT/CP_PASTE intents and leaves transfer to the
+     platform layer. Windows: OpenClipboard / GetClipboardData(CF_UNICODETEXT) /
+     SetClipboardData / CloseClipboard. Vastly simpler than X11 selections — no
+     ownership negotiation, no INCR protocol, no target atoms. Note the clipboard
+     is a global lock: open it, do the one thing, close it immediately, and never
+     hold it across anything that can block.
+
+11.8 FOCUS
+     WM_KILLFOCUS must call Core::release_all_keys(). The comment in event.rs is
+     exactly right and applies verbatim on Windows: keys left set would make our
+     own autorepeat run forever. Windows makes this worse than X11 because Alt+Tab
+     can steal focus mid-keypress and you will never see the WM_KEYUP.
+     Also handle WM_ACTIVATE / WM_ACTIVATEAPP and set Core::focused.
+
+
+================================================================================
+12. DPI AND SCALE
+================================================================================
+
+Core::scale_fx is 16.16 fixed (65536 = 1.0).
+
+Declare per-monitor DPI awareness v2 — preferably via
+SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) at
+startup rather than a manifest, since a manifest is another build artifact to
+ship and the API call keeps everything in code. Without it Windows lies to you
+about window sizes and bitmap-stretches your output, which for a crate whose
+entire premise is exact pixels is unacceptable.
+
+Then GetDpiForWindow(hwnd) (Windows 10 1607+) gives DPI; scale_fx = dpi * 65536 /
+96. Handle WM_DPICHANGED, which conveniently supplies a suggested new window
+rectangle in lParam that you should honour with SetWindowPos, and update
+scale_fx so the next RENDER carries it.
+
+
+================================================================================
+13. WINDOW LIFECYCLE ODDS AND ENDS
+================================================================================
+
+13.1 RESIZE
+     WM_SIZE updates Core::win_w/win_h. The swapchain needs ResizeBuffers, and
+     ALL references to its backbuffers must be released first or the call fails —
+     this is the single most common D3D11 resize bug. If the CPU buffer stays a
+     fixed power-of-two N x N and is scaled into the window by the quad, the CPU
+     buffer itself does NOT need reallocating on resize, which is a real
+     simplification and a point in favour of the quad over CopyResource (5.3.4).
+
+     Windows enters a MODAL RESIZE LOOP during a drag (WM_ENTERSIZEMOVE /
+     WM_EXITSIZEMOVE): DefWindowProc does not return until the drag ends, so your
+     message loop stops running and the window freezes mid-drag. The standard
+     answer is to drive rendering from a WM_TIMER started on WM_ENTERSIZEMOVE, or
+     to render from within the WM_SIZE handler. Know this before you see it and
+     conclude something is deadlocked.
+
+13.2 OCCLUSION
+     Present returns DXGI_STATUS_OCCLUDED when the window is fully hidden.
+     Continuing to Present at full rate is wasted work. Throttle, or wait, until a
+     later Present succeeds. Note this interacts with display_tick(): while
+     occluded there are no meaningful frame boundaries, so decide whether display
+     time freezes (probably yes) and document it.
+
+13.3 DEVICE LOSS
+     DXGI_ERROR_DEVICE_REMOVED / DXGI_ERROR_DEVICE_RESET after a driver update,
+     GPU hang, or hibernate. Rare but real, and a hard crash on driver update is a
+     bad look. Recreate the device, swapchain, and texture, then force
+     Core::full_redraw. The existing full_redraw flag is exactly the right hook.
+
+13.4 CLOSE
+     WM_CLOSE -> Core::push_close(); let the app decide, and only DestroyWindow
+     when it does. Do not close the window from the pump on the app's behalf.
+
+13.5 FULLSCREEN
+     Prefer borderless-fullscreen-window (style change plus SetWindowPos to the
+     monitor rect) over DXGI SetFullscreenState. It alt-tabs cleanly, avoids mode
+     changes, and on modern Windows the compositor gives it the same
+     independent-flip fast path anyway. Drives Core::wants_fullscreen.
+
+13.6 WINDOW CLASS AND MESSAGE LOOP HYGIENE
+     Register with CS_OWNDC if you keep a DC around. Return 0 from WM_ERASEBKGND
+     to prevent GDI flicker-painting the background under your D3D output. Use the
+     W (wide) API variants throughout — under a Windows 10 floor there is no
+     reason to touch the A variants, and Rust strings convert to UTF-16 easily.
+
+
+================================================================================
+14. BUILD AND TOOLCHAIN
+================================================================================
+
+14.1 TARGET
+     Add x86_64-pc-windows-msvc to rust-toolchain.toml's targets list. Note
+     .cargo/config.toml currently sets `target = "x86_64-unknown-linux-musl"`
+     under [build], which makes musl the DEFAULT for every bare `cargo build`.
+     Windows builds must pass --target explicitly, or the config needs
+     restructuring. Do not silently change the Linux default — that comment in
+     .cargo/config.toml is deliberate and the static musl binary is a project
+     goal.
+
+14.2 CROSS-COMPILING FROM LINUX
+     Two routes:
+       (a) x86_64-pc-windows-gnu with mingw-w64 installed. Cross-compiles cleanly
+           from Linux and needs no Microsoft tooling. Good for CI and for a
+           developer who does not have Windows.
+       (b) x86_64-pc-windows-msvc, which needs the MSVC linker and Windows SDK
+           import libraries. Cross-linkable with the xwin tool, but that is
+           external tooling and Microsoft-licensed headers.
+     The GNU target is the better fit for a project that values self-contained
+     builds. Verify that everything in this document is reachable through mingw's
+     import libraries — d3d11 and dxgi are, dwmapi is, synchronization/
+     WaitOnAddress should be checked (17.7).
+
+14.3 STATIC LINKING
+     The Linux goal is a fully static binary. The Windows analog is: no vcruntime
+     redistributable dependency. For MSVC targets, `-C target-feature=+crt-static`
+     statically links the CRT. Note that kernel32/user32/gdi32/d3d11/dxgi are
+     always dynamically linked and always present on the system — that is not a
+     dependency in any meaningful sense, it is the OS. The goal is "no DLL the
+     user must install," and that is achievable.
+
+     Explicitly: do NOT ship d3dcompiler_47.dll (4.4).
+
+14.4 PANIC AND PROFILE
+     Cargo.toml sets panic = "abort" for release, which is correct on Windows too
+     and avoids SEH unwinding machinery entirely.
+
+
+================================================================================
+15. RECOMMENDED IMPLEMENTATION ORDER
+================================================================================
+
+Each step should end at something runnable. Resist doing 3 before 2.
+
+  1. src/sys_win.rs: the extern "system" declarations for kernel32/user32 —
+     window creation, message loop, WaitOnAddress, timing (QueryPerformanceCounter).
+     Milestone: an empty window that opens, responds, and closes cleanly.
+
+  2. Wire the message loop into Core: push Close, Buttons, Text, Axes.
+     Milestone: input events appear in the ring in the right order, verified by
+     an example that prints them. Do this BEFORE any rendering — input ordering
+     is the subtle part and it is much easier to debug with no pixels involved.
+
+  3. GDI scaffold (5.2), StretchDIBits from a plain buffer, RENDER events paced
+     by a crude timer.
+     Milestone: something visible on screen. This is throwaway; keep it small
+     and delete it at step 5.
+
+  4. D3D11 device + swapchain + persistent texture + quad. Still crude pacing.
+     Milestone: same picture, now through D3D11, with Present(1,0) vsync.
+
+  5. Real pacing: waitable object, GetFrameStatistics, refresh-period query,
+     display_tick with true frame counts. Delete the GDI path.
+     Milestone: display time provably locked to the display. Test by logging
+     PresentRefreshCount deltas and confirming they are 1 under load and 2 when
+     you deliberately stall a frame.
+
+  6. Damage tracking and partial UpdateSubresource.
+     Milestone: measurable drop in upload bytes with a mostly-static picture.
+
+  7. The long tail: DPI, resize, fullscreen, clipboard, occlusion, device loss.
+
+  8. Touchpad zoom/rotate via raw HID, if wanted.
+
+Steps 1-5 are the real project. Everything after is finite and unsurprising.
+
+
+================================================================================
+16. OPEN QUESTIONS FOR THE USER
+================================================================================
+
+These were raised and not answered; they change the design and should be settled
+before writing code rather than guessed at.
+
+ Q1. WHAT WAS THE SHARED MEMORY FOR? Purely the Wayland/X11 compositor handoff,
+     or does a second process of yours read the framebuffer? If purely the
+     handoff, the Windows backend drops shm entirely (section 9) and uses a plain
+     allocation.
+
+ Q2. WHAT IS THE WINDOWS FLOOR? Windows 10 (tier-1, std, everything works) or
+     Windows 7 (tier-3 target, nightly, -Z build-std, degraded pacing)?
+     Recommendation is Windows 10; this needs an explicit yes.
+
+ Q3. ONE CPU BUFFER OR TWO? Section 6 argues one. The counter-argument is
+     uniformity of the (gen << 1 | idx) key across backends. Which matters more?
+
+ Q4. WHO OWNS THE DAMAGE MASK — app-declared or library-inferred? (7.4.)
+
+ Q5. DEAD KEYS — let Windows compose (less code, native behaviour) or drive our
+     own tables (identical behaviour cross-platform)? (11.3.)
+
+ Q6. IS ZOOM/ROTATE REQUIRED FOR A FIRST WINDOWS VERSION? If not, ship without
+     and add raw HID parsing later (11.6).
+
+ Q7. IS THE WINDOWS BACKEND EVEN IN SCOPE FOR softer_gui, or a separate crate?
+     The stated purpose of this crate is replacing zebra-gui's platform layer on
+     Linux with a static musl binary. Windows is a different axis. A shared
+     event.rs with two platform crates over it may be cleaner than one crate with
+     a large #[cfg] seam.
+
+
+================================================================================
+17. FACTS TO RE-VERIFY BEFORE RELYING ON THEM
+================================================================================
+
+Everything in this document came from a design discussion, not from compiling
+anything against a current SDK. The items below are the ones where a wrong detail
+would cost real time. Confidence is stated honestly.
+
+ 17.1 (HIGH IMPACT, MEDIUM CONFIDENCE) The exact Rust release that dropped
+      Windows 7/8 support — stated here as 1.78 — and the current tier and name
+      of the *-win7-windows-msvc targets. Check the Rust platform-support page.
+      This determines the whole floor question (Q2), so verify it FIRST.
+
+ 17.2 (MEDIUM CONFIDENCE) That GetFrameStatistics in windowed mode is supported
+      ONLY for flip-model swapchains. Believed correct and documented, and the
+      design leans on it in 8.4.
+
+ 17.3 (HIGH CONFIDENCE) DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL is Windows 8+ and
+      FLIP_DISCARD is Windows 10+. Only matters if the floor drops.
+
+ 17.4 (HIGH CONFIDENCE) IDXGISwapChain2 and GetFrameLatencyWaitableObject are
+      Windows 8.1+, and require the swapchain to be created with
+      DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.
+
+ 17.5 (HIGH CONFIDENCE) The exact field list of DXGI_FRAME_STATISTICS. Transcribe
+      from dxgi.h rather than from section 8.4.
+
+ 17.6 (LOW-MEDIUM CONFIDENCE) That DwmGetCompositionTimingInfo requires a NULL
+      HWND on Windows 8+. Verify, or sidestep it entirely by taking the refresh
+      rate from DXGI_MODE_DESC instead (8.5(c)), which avoids the question.
+
+ 17.7 (MEDIUM CONFIDENCE) That WaitOnAddress links via synchronization.lib rather
+      than kernel32.lib, and that mingw-w64 provides it. Trivial to check; would
+      be annoying to guess wrong about at link time.
+
+ 17.8 (MEDIUM CONFIDENCE) UpdateSubresource's pSrcData/SrcRowPitch convention when
+      a D3D11_BOX is supplied (5.3.2). The stated convention — pointer to the
+      first pixel of the box, pitch of the full buffer — is believed correct but
+      is exactly the kind of detail worth confirming against the docs before
+      debugging a smeared image.
+
+ 17.9 (HIGH CONFIDENCE, WORTH RESTATING) CreateDIBSection's hSection parameter and
+      the 4-byte dwOffset alignment requirement.
+
+17.10 (MEDIUM CONFIDENCE) The precise mapping tables in SPI_GETKEYBOARDDELAY and
+      SPI_GETKEYBOARDSPEED index-to-milliseconds (11.5). The ranges are right; the
+      exact endpoints should be checked.
+
+17.11 (UNVERIFIED, FLAGGED AS SUCH) The claim that evdev codes and set-1 scancodes
+      largely coincide for the main keyboard block (11.1). Directionally true and
+      historically motivated, but build the table from an authoritative source and
+      test it on a real keyboard rather than trusting the coincidence.
+
+================================================================================
+END
+================================================================================

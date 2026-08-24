@@ -1,0 +1,824 @@
+================================================================================
+ICONS FOR APE (ACTUALLY PORTABLE EXECUTABLE) BINARIES
+Windows / Linux / macOS — executable icons and window icons
+================================================================================
+
+Written 2026-08-24. Companion to WINDOWS_RESEARCH.txt in this directory.
+
+SCOPE. Two questions were asked, and they turn out to be four:
+  - an icon on the EXECUTABLE FILE on Windows (what Explorer draws),
+  - an icon on the WINDOW at runtime on Windows (titlebar, Alt+Tab, taskbar),
+  - the same two on Linux,
+  - the same two on macOS,
+for a Cosmopolitan Libc APE binary — the polyglot .com file that is
+simultaneously a shell script, a PE, an ELF and a Mach-O.
+
+METHOD AND CONFIDENCE. The Cosmopolitan findings in section 2 are quoted
+verbatim from ape/ape.S and ape/ape.lds at master, fetched 2026-08-24, so they
+are solid. The platform API details are from documentation and from prior
+knowledge, and are marked where uncertain. NOTHING HERE HAS BEEN TESTED. Section
+11 is a confidence audit; section 11.1 in particular is a cheap test that could
+invalidate a large part of section 3, and should be run before any work starts.
+
+A NOTE ON THE FRAMING. The concern raised was not regressing on having an icon.
+Worth saying plainly: the difficulty here is not incidental and is not something
+the platforms overlooked. It is intrinsic to SINGLE-FILE DISTRIBUTION. Every OS
+has a well-trodden icon path, and on two of the three it runs through a
+container the APE deliberately refuses to be — a .desktop file on Linux, an .app
+bundle on macOS. Windows is the one platform that puts icons inside the
+executable, which is why Windows is both the most tractable of the three and the
+one worth spending effort on.
+
+
+================================================================================
+0. SUMMARY — THE FOUR PROBLEMS, RANKED BY TRACTABILITY
+================================================================================
+
+(0.1) WINDOWS, WINDOW/TASKBAR/ALT-TAB ICON AT RUNTIME — EASY, DO THIS FIRST.
+      Solvable today with no changes to the APE format, no PE resource, no
+      toolchain work, and no dependencies. Embed .ico bytes with include_bytes!,
+      build an HICON at runtime with CreateIconFromResourceEx, and set it with
+      WM_SETICON. Roughly 60 lines. See section 4.
+      IMPORTANT: this covers the titlebar, Alt+Tab, and the RUNNING taskbar
+      button. It does NOT cover Explorer. Those are separate icon sources and
+      conflating them is the main way to get confused here.
+
+(0.2) WINDOWS, EXECUTABLE ICON IN EXPLORER — HARD BUT BOUNDED.
+      APE's PE header currently has NO resource data directory at all.
+      Verbatim from ape/ape.S:
+
+         .long	2			// NumberOfDirectoryEntries
+         .long	0,0			// ExportsDirectory
+         .long	ape_idata		// ImportsDirectory
+         .long	ape_idata_idtsize	// ImportsDirectorySize
+
+      NumberOfRvaAndSizes is 2, so only index 0 (Export) and index 1 (Import)
+      exist. The resource directory is index 2. Windows will therefore never
+      look for resources in an APE, because as far as the loader is concerned
+      the array ends before that entry. Four section headers are declared —
+      .text, .rdata, .idata, .data — and none is .rsrc.
+      Fixing this means editing ape.S and ape.lds. See section 3.
+
+(0.3) LINUX — NOT A FILE PROPERTY AT ALL. There is no such thing as an icon
+      embedded in an ELF, and no desktop environment looks for one. Icons come
+      from a .desktop file plus the hicolor icon theme, which is a second and
+      third file. The window icon is separately solvable at runtime and is easy
+      on X11, awkward on Wayland. See sections 5 and 6.
+
+(0.4) macOS — EFFECTIVELY UNSOLVED FOR A SINGLE FILE. The icon of a macOS
+      program lives in its .app bundle, and an APE is by definition not a
+      bundle. The only mechanism for a bare file is a resource-fork extended
+      attribute, which does not survive copying to non-Apple filesystems, most
+      archive formats, or downloads. The Dock icon IS settable at runtime. See
+      sections 7 and 8.
+
+THE HONEST SUMMARY: you can have a good Windows story, a good X11 story, a
+workable Wayland story, a "ship a .desktop file" Linux story, and essentially no
+macOS story short of also shipping a .app bundle.
+
+
+================================================================================
+1. THE DECOMPOSITION THAT MAKES THIS TRACTABLE
+================================================================================
+
+The single most useful thing to internalise is that "the icon" is not one thing.
+On Windows alone there are two entirely independent sources:
+
+  SOURCE A — THE PE RESOURCE (RT_GROUP_ICON / RT_ICON in the executable file).
+     Read by: Explorer file listings, the desktop, shortcut (.lnk) targets,
+     PINNED taskbar buttons, the Open With dialog, file property sheets.
+     Read by parsing the FILE ON DISK, before the program ever runs.
+
+  SOURCE B — THE WINDOW ICON (set at runtime via WM_SETICON or WNDCLASSEX).
+     Read by: the window titlebar, the Alt+Tab switcher, the RUNNING taskbar
+     button, the window's system menu.
+     Set by the process while it is alive. No file parsing involved.
+
+If SOURCE B is set, a running APE looks completely correct — correct titlebar,
+correct Alt+Tab, correct taskbar. Only the file's appearance in Explorer, and a
+pinned shortcut, fall back to the generic executable icon. If SOURCE B is NOT
+set, Windows falls back to the PE resource for the window icon too, and with no
+PE resource either you get the generic icon everywhere.
+
+CONSEQUENCE FOR PLANNING: implement SOURCE B first. It is cheap, it is
+self-contained, it fixes the visible-while-running case entirely, and it is
+completely decoupled from the ape.S surgery that SOURCE A requires. Do not let
+the hard problem block the easy one.
+
+The same split exists on the other platforms:
+  Linux:  SOURCE A = .desktop + icon theme (external files).
+          SOURCE B = _NET_WM_ICON on X11 / xdg-toplevel-icon-v1 on Wayland.
+  macOS:  SOURCE A = .app bundle Info.plist, or resource-fork xattr.
+          SOURCE B = NSApplication.applicationIconImage (the Dock icon).
+
+
+================================================================================
+2. WHAT APE ACTUALLY IS, AND WHY THE ICON IS AWKWARD
+================================================================================
+
+2.1 THE FORMAT
+    An APE binary is a polyglot. The file begins with the eight bytes MZqFpD='
+    which is simultaneously a valid MS-DOS MZ signature and a valid shell
+    variable assignment. The same bytes are then interpreted as a PE executable
+    by Windows, an ELF by Linux, a Mach-O by macOS, and a shell script by a
+    POSIX shell. Per the APE specification, "the 0x4a relative offset of the
+    magic causes execution to jump into the MS-DOS stub defined by Portable
+    Executable."
+
+    Everything in the first pages of the file is therefore a carefully packed
+    jigsaw. Every byte is doing at least two jobs. This is why adding anything
+    to the headers is delicate: you are not adding a field to a struct, you are
+    adding a field to a struct that overlaps three other structs.
+
+2.2 WHAT THE PE HEADERS CONTAIN TODAY (verbatim, ape/ape.S at master)
+
+    Optional header, relevant excerpts:
+
+       .short	kNtPe64bit		// Optional Header Magic
+       .long	RVA(ape_pe_entry)	// EntryPoint
+       .quad	ape_pe_base		// ImageBase
+       .long	ape_pe_sectionalignment	// SectionAlignment
+       .long	ape_pe_filealignment	// FileAlignment
+       .long	RVA(_end)		// SizeOfImage
+       .long	ape_pe_sizeofheaders	// SizeOfHeaders
+       .long	0			// LoaderFlags
+       .long	2			// NumberOfDirectoryEntries
+       .long	0,0			// ExportsDirectory
+       .long	ape_idata		// ImportsDirectory
+       .long	ape_idata_idtsize	// ImportsDirectorySize
+
+    Section headers, all four:
+
+       .ascin	".text",8    ... .long PETEXT
+       .ascin	".rdata",8   ... .long PERDAT
+       .ascin	".idata",8   ... .long PEIMPS
+       .ascin	".data",8    ... .long PEDATA
+
+    THE OPERATIVE FACTS:
+      - NumberOfRvaAndSizes == 2. The data directory array has exactly two
+        entries. IMAGE_DIRECTORY_ENTRY_RESOURCE is index 2 and is off the end.
+      - No .rsrc section exists.
+      - Both are required for Windows to find an icon. Neither is present.
+
+2.3 THE GOOD NEWS FROM ape/ape.lds
+
+       ape_pe_filealignment = 4096;
+       ape_pe_sectionalignment = 4096;
+       ape_pe_sizeofheaders = SIZEOF(.head);
+
+    and the .head output section is padded to a page boundary on Windows
+    targets, with an explicit padding input section:
+
+       KEEP(*(.ape.pad.head))
+
+    SectionAlignment == FileAlignment == 4096 is convenient: RVAs and file
+    offsets advance in lockstep, so a resource section's RVA and its file offset
+    can be kept trivially consistent, which is the usual source of pain when
+    hand-building a .rsrc. And .head is page-padded with a named padding section
+    that exists precisely so the header region can grow. The 8 bytes for a third
+    data directory entry and the 40 bytes for a fifth section header need to
+    come out of that padding budget. Whether the budget currently has ~48 bytes
+    of slack is the first thing to measure (11.2) — but the mechanism for
+    growing it is there by design, which is a much better starting position
+    than "the headers are full."
+
+2.4 THE ZIP CONSIDERATION
+    APE binaries are also ZIP files — assets are appended and the ZIP central
+    directory lives at the end of the file. Any .rsrc section must live inside
+    the PE image region and must not cause SizeOfImage or a section's
+    SizeOfRawData to claim bytes belonging to the ZIP, or the ZIP reader and the
+    PE loader will disagree about the file. Placing .rsrc immediately after
+    .data and before the ZIP payload is the natural spot. FLAGGED as a thing to
+    check, not a known problem.
+
+2.5 THE SELF-MODIFICATION CONSIDERATION
+    APE binaries historically rewrite their own headers on first run
+    ("assimilation") unless built to avoid it. Any icon resource must survive
+    that rewrite. If assimilation rewrites the header region wholesale, an icon
+    added by post-processing could be destroyed on first run while an icon built
+    into ape.S would not be. This is an argument for the ape.S route over the
+    post-processing route (3.4), and it is UNVERIFIED — see 11.4.
+
+
+================================================================================
+3. WINDOWS: EXECUTABLE ICON (SOURCE A)
+================================================================================
+
+3.1 WHAT WINDOWS REQUIRES
+    Three things, all of which must be consistent:
+
+    (a) A resource data directory entry at index 2 of the optional header's data
+        directory, with a valid RVA and size, and NumberOfRvaAndSizes >= 3.
+    (b) A section containing a well-formed PE resource tree. Conventionally
+        named .rsrc, but the name is not load-bearing — the directory entry's
+        RVA is what matters. The tree is three levels: TYPE -> NAME/ID ->
+        LANGUAGE, with leaves pointing at IMAGE_RESOURCE_DATA_ENTRY structures
+        that carry an RVA and size for the actual bytes.
+    (c) Under RT_GROUP_ICON (type 14) a GRPICONDIR, and under RT_ICON (type 3)
+        one resource per image.
+
+    THE CRITICAL DETAIL, and the one that trips people writing this by hand:
+    AN .ico FILE CANNOT BE EMBEDDED VERBATIM. The on-disk .ico format and the
+    in-resource format differ in exactly one field. An .ico file is:
+
+        ICONDIR      { u16 reserved=0; u16 type=1; u16 count; }
+        ICONDIRENTRY { u8 width; u8 height;      // 0 means 256
+                       u8 colorCount; u8 reserved;
+                       u16 planes; u16 bitCount;
+                       u32 bytesInRes;
+                       u32 imageOffset; }        // <-- FILE OFFSET
+        ... then the image blobs ...
+
+    In the PE resource, the group directory entry is identical except the final
+    u32 imageOffset is replaced by a u16 id naming the RT_ICON resource that
+    holds that image. So each entry is 14 bytes rather than 16, and the images
+    move into separate RT_ICON resources. A build step must perform that
+    transformation. It is mechanical and about thirty lines of code.
+
+    Each image blob is either a BITMAPINFOHEADER-format DIB — note its biHeight
+    is DOUBLE the real height, because the blob contains the XOR colour mask
+    followed by the AND transparency mask — or, for the 256x256 entry on Vista
+    and later, a complete PNG file. Store whichever the .ico contained, byte for
+    byte; the resource does not reinterpret it.
+
+    CONVENTION THAT MATTERS: Explorer uses the RT_GROUP_ICON resource with the
+    LOWEST numeric ID as the application's icon. Give the main group ID 1.
+
+3.2 WHAT MUST CHANGE IN COSMOPOLITAN
+    Concretely, in ape/ape.S:
+      - change  .long 2  // NumberOfDirectoryEntries  to  .long 3
+      - append  .long ape_rsrc_rva ; .long ape_rsrc_size  after the imports pair
+      - add a fifth section header:
+            .ascin ".rsrc",8
+            .long ape_rsrc_memsz
+            .long ape_rsrc_rva
+            .long ape_rsrc_filesz
+            .long ape_rsrc_offset
+            .long PERDAT           // read-only initialized data is correct here
+    and in ape/ape.lds:
+      - define an output section collecting a .rsrc input section, page-aligned,
+        exporting ape_rsrc_rva / ape_rsrc_offset / ape_rsrc_memsz /
+        ape_rsrc_filesz the same way the existing sections do, placed after
+        .data and before any ZIP payload.
+
+    The resource tree itself can then be produced by a small build-time tool
+    that reads an .ico and emits either an assembly file or a linkable object
+    containing the tree in a .rsrc input section. Because SectionAlignment ==
+    FileAlignment == 4096, computing the internal RVAs is straightforward: every
+    RVA inside the tree is (section RVA + offset within the blob).
+
+    RISKS, in descending order:
+      - The 48 bytes of header growth collide with the ELF program headers or
+        Mach-O load commands packed into the same region. This is the real risk
+        and it is why 11.2 should be measured first.
+      - Bumping NumberOfRvaAndSizes changes the offset of the section header
+        table, which some part of the polyglot may depend on being where it is.
+      - Assimilation rewrites the headers (2.5).
+
+3.3 THIS IS APPARENTLY UNSOLVED TERRITORY
+    Searching for prior art — Cosmopolitan issues, discussions, or tooling for
+    icons on APE binaries — turned up nothing. No flag in cosmocc or apelink, no
+    documented recipe, no third-party tool. The APE specification does not
+    mention resources at all. So this is not a matter of finding the switch;
+    either nobody has needed it, or it was tried and abandoned. Treat it as
+    original work, budget accordingly, and consider raising it upstream — jart
+    is more likely to know in thirty seconds whether the header budget allows it
+    than any amount of reverse-engineering will establish.
+
+3.4 THE POST-PROCESSING ALTERNATIVE, AND WHY IT PROBABLY FAILS
+    The obvious shortcut is to build the APE normally and then run an existing
+    PE resource editor over it: rcedit (Electron's tool), Resource Hacker
+    (Windows GUI, has a CLI), editpe (a pure-Rust PE resource editor), or LIEF
+    (Python).
+
+    All of these work by parsing the PE, adding or rewriting a section, and
+    fixing up the headers. On an ordinary PE that is safe. On an APE it is
+    probably not, because every one of them assumes it may relocate things and
+    rewrite the header region, and none of them knows that the same bytes are
+    also an ELF header, a Mach-O load command table, and a shell script. The
+    likely outcome is a file with a correct Windows icon that no longer runs on
+    Linux or macOS — which is the worst possible failure, because it will pass a
+    Windows test and break silently everywhere else.
+
+    IF YOU TRY IT ANYWAY: test on all three platforms afterwards, every time,
+    and diff the first 4096 bytes before and after to see exactly what moved.
+    Verdict: worth ONE timeboxed experiment because it is cheap, but do not
+    build a pipeline on it.
+
+3.5 THE FILE EXTENSION PROBLEM — CHECK THIS BEFORE DOING ANY OF THE ABOVE
+    APE binaries are conventionally named .com. Windows runs them either way;
+    Cosmopolitan's guidance is that the file needs a .exe or .com extension to
+    execute.
+
+    But EXECUTING and having Explorer EXTRACT AN ICON are different code paths.
+    The shell decides how to draw a file largely from its extension and the
+    registered handler for it, and .com is a legacy MS-DOS extension. It is
+    entirely plausible that Explorer will not parse PE resources out of a .com
+    file at all, and will draw the generic MS-DOS executable icon no matter what
+    resources the file contains.
+
+    I DO NOT KNOW WHETHER THIS IS TRUE. It is a five-minute experiment: take any
+    ordinary .exe with an icon, copy it to foo.com, and look at it in Explorer.
+
+    IF THE ICON DISAPPEARS ON RENAME, then all of section 3 is moot unless the
+    Windows-facing artifact is named .exe, and the correct fix is to ship
+    myapp.exe on Windows rather than to modify ape.S. That would be a far
+    cheaper answer than the header surgery, which is exactly why it should be
+    tested first. See 11.1.
+
+
+================================================================================
+4. WINDOWS: WINDOW ICON AT RUNTIME (SOURCE B) — THE EASY WIN
+================================================================================
+
+4.1 THE MECHANISM
+    Two ways in, and they compose:
+
+    (a) At window class registration:
+           WNDCLASSEXW { .hIcon = big, .hIconSm = small, ... }
+        Applies to every window of the class.
+
+    (b) Per window, at any time:
+           SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hIconSmall as LPARAM);
+           SendMessageW(hwnd, WM_SETICON, ICON_BIG,   hIconBig   as LPARAM);
+
+        ICON_SMALL feeds the titlebar and the small taskbar representation;
+        ICON_BIG feeds Alt+Tab and larger presentations.
+
+    Size the icons from system metrics rather than hardcoding 16 and 32 —
+    GetSystemMetrics(SM_CXSMICON / SM_CYSMICON) and (SM_CXICON / SM_CYICON) —
+    because they change with DPI. Under the per-monitor DPI v2 awareness that
+    WINDOWS_RESEARCH.txt section 12 recommends, prefer the DPI-aware variants
+    (GetSystemMetricsForDpi) and re-create the icons on WM_DPICHANGED.
+
+4.2 GETTING AN HICON WITH NO PE RESOURCE — THE KEY TRICK
+    LoadIconW(hInstance, MAKEINTRESOURCE(n)) reads from PE resources, which the
+    APE does not have. But CreateIconFromResourceEx does not need a resource at
+    all — despite the name, it takes a POINTER TO ICON IMAGE BYTES:
+
+       CreateIconFromResourceEx(
+          pbIconBits,   // the RT_ICON-style image blob: a DIB or a PNG
+          cbIconBits,
+          TRUE,         // fIcon (FALSE would make a cursor)
+          0x00030000,   // dwVersion — always this value
+          cxDesired, cyDesired,
+          LR_DEFAULTCOLOR) -> HICON
+
+    So the whole runtime path, with zero dependencies and no PE resource, is:
+
+       1. include_bytes!("icon.ico") — the ordinary .ico file, embedded.
+       2. Parse its ICONDIR/ICONDIRENTRY table. It is a flat array with an
+          absolute file offset per image; about twenty lines of Rust, no
+          allocation needed.
+       3. Pick the entry closest to the desired size (remember height 0 means
+          256).
+       4. CreateIconFromResourceEx on that entry's bytes at its file offset.
+       5. WM_SETICON.
+
+    Do it twice, once for the small size and once for the big size, picking the
+    best-matching entry each time rather than letting Windows rescale one image.
+
+    ALTERNATIVE, slightly less code: LookupIconIdFromDirectoryEx() over the .ico
+    directory picks the best entry for you, then CreateIconFromResourceEx on the
+    result. It expects the resource-form directory though, so for a raw .ico
+    file doing the selection yourself is simpler and more predictable.
+
+    DO NOT use CreateIcon() or CreateIconIndirect() with hand-built bitmaps
+    unless you need something dynamic — they require you to construct HBITMAPs
+    for colour and mask, which is more code and worse alpha handling.
+
+4.3 CLEANUP
+    DestroyIcon() the HICONs at shutdown, and before replacing them on a DPI
+    change. Icons set via WM_SETICON are not owned by the window; leaking them
+    across many DPI changes is a real if slow GDI handle leak.
+
+4.4 WHY THIS IS THE RIGHT FIRST MOVE
+    It is a self-contained afternoon, it needs no toolchain change, it cannot
+    break the polyglot because it touches no headers, and it fixes every place
+    the icon is visible while the program is running. Whatever happens with
+    section 3, this should exist.
+
+
+================================================================================
+5. LINUX: EXECUTABLE ICON — THERE ISN'T ONE
+================================================================================
+
+5.1 THE SITUATION
+    ELF has no resource section and no icon concept, and no Linux desktop looks
+    inside an executable for an icon. This is not a gap to work around; it is
+    simply how the platform is designed. Icons are a DESKTOP-ENTRY concern, not
+    a file-format concern.
+
+    The mechanism is the freedesktop.org Desktop Entry Specification plus the
+    Icon Theme Specification:
+
+       ~/.local/share/applications/myapp.desktop      (or /usr/share/...)
+          [Desktop Entry]
+          Type=Application
+          Name=My App
+          Exec=/path/to/myapp.com
+          Icon=myapp                 <-- a NAME, not a path
+          StartupWMClass=myapp       <-- see 6.4, this matters
+
+       ~/.local/share/icons/hicolor/48x48/apps/myapp.png
+       ~/.local/share/icons/hicolor/256x256/apps/myapp.png
+       ~/.local/share/icons/hicolor/scalable/apps/myapp.svg
+
+    Icon= may also be an absolute path to an image file, which is uglier but
+    avoids the theme directory entirely and is a legitimate choice for a
+    single-file program that has to write something somewhere anyway.
+
+    After installing, `update-desktop-database` and `gtk-update-icon-cache` make
+    the change visible immediately; without them it appears eventually.
+
+5.2 WHAT THIS MEANS FOR A SINGLE-FILE DISTRIBUTION
+    The APE's premise is one file. The Linux icon story requires three. There is
+    no reconciling those; you can only choose where to put the seam:
+
+    (a) SHIP NOTHING. The binary has no icon in the file manager. For a program
+        launched from a terminal this genuinely may not matter, and the WINDOW
+        icon (section 6) is a separate and solvable problem.
+    (b) SELF-INSTALL ON FIRST RUN. The binary writes the .desktop file and the
+        PNGs into ~/.local/share on first launch. This is what a lot of
+        single-file programs do. It is easy — the icon bytes are already
+        embedded for section 6 — but it means a program that claims to be
+        self-contained is now writing to the user's home directory, which some
+        users will object to. Gate it behind an explicit --install flag rather
+        than doing it silently.
+    (c) SHIP A .desktop ALONGSIDE. Honest, conventional, and gives up the
+        one-file property for desktop users while keeping it for everyone else.
+
+    RECOMMENDATION: (a) plus (b) behind an explicit flag. Never install
+    silently.
+
+5.3 THE AppImage PRECEDENT
+    AppImage faces exactly this problem and solves it by embedding a .desktop
+    file and icon INSIDE the image, which a helper daemon (appimaged) or the
+    desktop's own AppImage integration extracts and installs. The relevant
+    lesson is negative: even a format designed around single-file distribution
+    concluded there was no way to make the file itself carry an icon, and fell
+    back to extract-and-install. Do not spend time looking for the trick.
+    There isn't one.
+
+5.4 THE ONE PARTIAL EXCEPTION
+    GNOME Files supports per-file custom icons stored in GVfs metadata, and
+    thumbnailer plugins can generate images for arbitrary file types. Both are
+    per-desktop, per-user, non-portable, and not worth pursuing. Noted only so
+    nobody rediscovers them and thinks they found something.
+
+
+================================================================================
+6. LINUX: WINDOW ICON AT RUNTIME
+================================================================================
+
+6.1 X11 — _NET_WM_ICON, AND IT IS GENUINELY EASY HERE
+    Set the _NET_WM_ICON property on the toplevel window. Type CARDINAL, format
+    32. The value is a sequence of images concatenated, each laid out as:
+
+       u32 width
+       u32 height
+       u32 pixels[width * height]     // ARGB8888, high byte alpha,
+                                      // rows top to bottom, left to right
+
+    Supply several sizes in one property — 16, 32, 48, 64, 128, 256 — and the
+    window manager picks. This is the modern EWMH mechanism and essentially
+    every X11 window manager honours it.
+
+    A REAL ADVANTAGE OF THIS CRATE'S DESIGN. The classic bug with _NET_WM_ICON
+    is that Xlib's XChangeProperty with format=32 expects an array of C `long`,
+    which is 64 bits on LP64, so callers who pass a u32 array get garbage and
+    callers who pass a long array find Xlib narrowing each element. Countless
+    programs have got this wrong. softer_gui writes the X11 wire protocol
+    directly, where format=32 means actual 32-bit values on the wire, so the
+    problem does not exist. You write u32s and they are u32s. Do not port the
+    workarounds you will find in other codebases.
+
+    IMPLEMENTATION NOTE: a large icon set can exceed the maximum request size
+    for a single ChangeProperty. Either keep the set modest or use the
+    incremental append form (PropModeAppend) across several requests. Check
+    maximum-request-length from the connection setup reply, which the wire-level
+    code already parses.
+
+    AMBIGUITY WORTH KNOWING: the EWMH text does not clearly state whether the
+    alpha is premultiplied, and implementations have historically differed.
+    Non-premultiplied ARGB is the common interpretation and what most toolkits
+    emit. If icons look dark or haloed at the edges, this is the reason — test
+    against at least one GTK and one Qt-based window manager.
+
+6.2 X11 — THE OBSOLETE FALLBACK
+    ICCCM's WM_HINTS carries icon_pixmap and icon_mask fields. This predates
+    _NET_WM_ICON, requires creating an X Pixmap and uploading an image to it,
+    and gives you a 1-bit transparency mask rather than an alpha channel. A few
+    very old window managers read only this. Not worth implementing unless a
+    specific target environment demands it.
+
+6.3 WAYLAND — THE HARD ONE, HISTORICALLY
+    Core xdg-shell has NO way for a client to set its own window icon. This was
+    a deliberate design decision: the icon is considered a property of the
+    APPLICATION, not of the surface, and applications are identified by their
+    desktop entry. The only mechanism was:
+
+       xdg_toplevel.set_app_id("com.example.myapp")
+
+    and the compositor then looks for com.example.myapp.desktop in the XDG data
+    directories and takes the Icon= from it. So on Wayland, the WINDOW icon
+    problem reduces to the DESKTOP FILE problem of section 5 — which is to say
+    that a single-file APE with no .desktop file has, historically, simply not
+    been able to have a window icon on Wayland at all.
+
+    The app_id must MATCH the desktop file's basename for this to work. This is
+    the single most common reason a Wayland application shows a generic icon.
+
+6.4 WAYLAND — xdg-toplevel-icon-v1, THE NEW ANSWER
+    A staging protocol, xdg-toplevel-icon-v1, now exists specifically to fix
+    this. It lets a client set a toplevel's icon directly, either by naming an
+    icon from the XDG icon stock or by supplying pixel data as wl_buffers:
+
+       xdg_toplevel_icon_manager_v1.create_icon() -> xdg_toplevel_icon_v1
+       xdg_toplevel_icon_v1.set_name("myapp")        // from the icon theme
+         and/or
+       xdg_toplevel_icon_v1.add_buffer(buffer, scale) // raw pixels, repeatable
+       xdg_toplevel_icon_manager_v1.set_icon(toplevel, icon)
+
+    An icon must have either a name or at least one buffer to be applied. The
+    state is double-buffered and takes effect on the next wl_surface.commit of
+    the toplevel, consistent with the rest of Wayland. Passing null to set_icon
+    clears back to the default (i.e. the desktop-entry icon or a placeholder).
+
+    STATUS: SDL added support in March 2024, and GLFW has an open issue tracking
+    it. It is in wayland-protocols as a staging protocol. Compositor support is
+    NOT universal and should be treated as an enhancement, not a baseline —
+    verify against the specific compositors that matter before relying on it
+    (11.6).
+
+    FIT WITH THIS CRATE: excellent, and better than for most clients. The
+    add_buffer path wants a wl_buffer, and this crate already creates
+    shared-memory wl_buffers for its main rendering path — an icon buffer is the
+    same machinery at a smaller size. And because the protocol is hand-written
+    here anyway, adding one more small interface is incremental work rather than
+    waiting on a toolkit to expose it.
+
+    THE STRATEGY: bind xdg_toplevel_icon_manager_v1 if the compositor advertises
+    it and use add_buffer with the embedded icon; otherwise fall back to
+    set_app_id and accept whatever the desktop file provides. Always set
+    set_app_id regardless, since it drives window grouping and matching
+    independent of icons.
+
+6.5 StartupWMClass
+    On X11, and for XWayland clients, the desktop file's StartupWMClass must
+    match the window's WM_CLASS for the desktop to associate a running window
+    with its launcher entry. Get this wrong and the taskbar shows a duplicate
+    generic entry beside the pinned one. Set WM_CLASS explicitly rather than
+    letting it default to argv[0], which for an APE could be anything including
+    a full path.
+
+
+================================================================================
+7. macOS: EXECUTABLE ICON — EFFECTIVELY UNSOLVED
+================================================================================
+
+7.1 THE NORMAL MECHANISM, WHICH APE CANNOT USE
+    A macOS application's icon comes from its bundle: MyApp.app/Contents/
+    Info.plist declares CFBundleIconFile (or CFBundleIconName), naming an .icns
+    file in Contents/Resources. Finder reads the bundle. A Mach-O executable
+    that is not in a bundle gets the generic "Unix executable" icon, and there
+    is no Info.plist to consult.
+
+    An APE is a bare file. It is not a bundle and cannot be one, because a
+    bundle is a DIRECTORY. This is a categorical mismatch, not a limitation to
+    engineer around.
+
+7.2 THE RESOURCE-FORK MECHANISM, WHICH IS FRAGILE
+    macOS does support custom icons on arbitrary files — it is what "Get Info,
+    paste an image" does. The mechanism is two extended attributes:
+
+      - com.apple.ResourceFork, containing the icon converted into a classic
+        resource of type 'icns'.
+      - com.apple.FinderInfo, with the custom-icon flag (kHasCustomIcon) set.
+
+    These can be written programmatically. The tool `fileicon` does exactly
+    this, and the approach is documented as not invalidating code signatures,
+    because signature checksums cover only the data fork and deliberately ignore
+    extended attributes — which is also why quarantine flags do not break
+    signing.
+
+    WHY IT IS STILL NOT A REAL ANSWER: extended attributes are a filesystem
+    feature, not part of the file. They do not survive:
+      - copying to any non-Apple filesystem (a USB stick, most network shares),
+      - most archive formats — tar needs specific flags, plain zip drops them,
+      - downloading. A binary fetched over HTTP has no xattrs, full stop.
+    So the icon exists on the machine that set it and nowhere else. For a
+    program distributed as a single downloadable file — the entire point of an
+    APE — the icon is gone before the user ever sees it.
+
+7.3 THE PRACTICAL CONCLUSION
+    On macOS, either ship a .app bundle (which means giving up single-file
+    distribution on that platform, though the bundle can wrap the same APE
+    binary as its executable), or accept the generic icon. Setting the xattr at
+    first run is possible and would work for a user who keeps the file in place,
+    but it is a lot of machinery for an icon that vanishes the moment the file
+    moves.
+
+    If macOS matters, the least-bad option is probably a tiny .app bundle whose
+    Contents/MacOS/ executable IS the APE — you keep one binary, and the bundle
+    is just a directory with an Info.plist and an .icns around it.
+
+
+================================================================================
+8. macOS: WINDOW / DOCK ICON AT RUNTIME
+================================================================================
+
+8.1 THERE IS NO PER-WINDOW ICON
+    macOS window titlebars do not carry an application icon the way Windows and
+    many Linux WMs do. The only titlebar icon is the "proxy icon" of a document
+    window, which represents the DOCUMENT, not the app, and is not what is being
+    asked for here.
+
+8.2 THE DOCK ICON IS SETTABLE AT RUNTIME
+    This is the macOS equivalent of the Windows window icon, and it does work
+    for a non-bundled executable:
+
+       [NSApp setApplicationIconImage:someNSImage];
+
+    A process that is not a bundled app also needs to become a foreground
+    application to appear in the Dock at all, via TransformProcessType with
+    kProcessTransformToForegroundApplication.
+
+    FOR AN APE THIS IS AWKWARD BUT NOT IMPOSSIBLE. Both are Objective-C /
+    Carbon-era APIs, reachable from C through objc_msgSend and dlopen of
+    AppKit — and Cosmopolitan does provide limited dlopen support on macOS
+    specifically so APEs can reach system frameworks. Constructing the NSImage
+    from embedded bytes means NSData plus NSImage initWithData:, all through
+    objc_msgSend.
+
+    This is a meaningful amount of Objective-C-runtime plumbing for one icon.
+    Worth it only if a macOS GUI backend is being built anyway — in which case
+    the plumbing exists already and the icon is a few more calls on top.
+
+8.3 NOTE ON SCOPE
+    This crate currently has no macOS backend at all, and WINDOWS_RESEARCH.txt
+    section 16 raises whether Windows even belongs here. macOS is further still.
+    Section 8 is recorded for completeness; it should not drive any near-term
+    work.
+
+
+================================================================================
+9. SOURCE ASSETS YOU WILL NEED
+================================================================================
+
+One icon design, exported into three container formats. Keep the PNGs as the
+master and generate the containers, so they never drift.
+
+  MASTER          PNG at 16, 24, 32, 48, 64, 128, 256, 512 (and 1024 for macOS).
+                  Straight (non-premultiplied) alpha.
+
+  WINDOWS         .ico containing 16/32/48/256. The 256 entry should be stored
+                  PNG-compressed inside the .ico (Vista+ supports this and it
+                  keeps the file small); the smaller entries as 32bpp DIBs.
+                  Used by BOTH section 3 (PE resource) and section 4 (runtime
+                  HICON), so one asset serves both.
+
+  LINUX           The PNGs as-is, for the hicolor theme and for _NET_WM_ICON /
+                  xdg-toplevel-icon buffers. For the window icon you need raw
+                  ARGB8888, so either decode the PNG at runtime or — better for
+                  a zero-dependency crate — pre-decode at build time and embed
+                  raw pixel arrays. A 48x48 ARGB icon is 9 KiB uncompressed;
+                  embedding several sizes raw costs a few tens of kilobytes and
+                  saves you writing a PNG decoder. Take that trade.
+
+  macOS           .icns, only if a bundle is ever shipped.
+
+TOOLING: ImageMagick or `icotool` (from icoutils) build .ico from PNGs;
+`png2icns` or `iconutil` build .icns. All are build-time host tools, not
+runtime dependencies, so they do not touch the zero-dependency rule.
+
+
+================================================================================
+10. RECOMMENDED PLAN
+================================================================================
+
+Ordered so that cheap tests come before expensive work, and so that the easy
+win lands regardless of how the hard question resolves.
+
+  STEP 0 — THE FIVE-MINUTE TEST (11.1). Copy any icon-bearing .exe to foo.com
+     and look at it in Explorer. If the icon vanishes, section 3 is moot unless
+     the Windows artifact is renamed .exe, and renaming is the whole fix. This
+     one experiment can delete the single largest piece of work in this
+     document, so run it before anything else.
+
+  STEP 1 — WINDOWS RUNTIME ICON (section 4). Embedded .ico bytes,
+     CreateIconFromResourceEx, WM_SETICON. No format changes, no risk, fixes
+     titlebar, Alt+Tab and the running taskbar button. Do this regardless of
+     everything else.
+
+  STEP 2 — X11 _NET_WM_ICON (6.1). Also easy, also no format changes, and
+     unusually easy in this crate because of the raw wire protocol. Pre-decoded
+     ARGB arrays embedded at build time.
+
+  STEP 3 — WAYLAND. set_app_id always; bind xdg-toplevel-icon-v1 when the
+     compositor advertises it and feed it a wl_buffer. Fall back silently.
+
+  STEP 4 — LINUX DESKTOP INTEGRATION, behind an explicit --install flag. Writes
+     the .desktop file and hicolor PNGs. Never silent.
+
+  STEP 5 — MEASURE THE APE HEADER BUDGET (11.2). Only if step 0 said the PE
+     resource is worth having. Determine whether 48 bytes of slack exist in
+     .head. Consider asking upstream rather than reverse-engineering.
+
+  STEP 6 — THE ape.S / ape.lds CHANGE (3.2), plus the build-time .ico-to-
+     resource-tree tool. Test on Windows, Linux and macOS after every change.
+
+  STEP 7 — macOS, only if a macOS backend exists. Probably a .app bundle
+     wrapping the APE rather than any xattr cleverness.
+
+Steps 1-3 are days. Steps 5-6 are the open-ended part.
+
+
+================================================================================
+11. THINGS TO VERIFY — RANKED BY WHAT THEY WOULD CHANGE
+================================================================================
+
+11.1 (HIGHEST VALUE, TRIVIAL TO TEST, UNVERIFIED) Does Windows Explorer extract
+     and display embedded PE icons from a file with a .com extension, or only
+     from .exe? I do not know, and I could find nothing that settles it. If .com
+     suppresses icon extraction, section 3 is unnecessary and the fix is to name
+     the Windows artifact .exe. TEST THIS FIRST. Everything else in the Windows
+     plan is downstream of the answer.
+
+11.2 (HIGH IMPACT, MEASURABLE) How much slack is actually in the APE .head
+     region? Adding a third data directory entry costs 8 bytes and a fifth
+     section header costs 40. ape.lds shows .head is page-padded and has a named
+     .ape.pad.head input section, which is encouraging, but the actual free
+     space must be measured against a real build. Determines whether 3.2 is
+     straightforward or requires relayout.
+
+11.3 (VERIFIED, 2026-08-24) That APE's PE optional header declares
+     NumberOfRvaAndSizes == 2 with no resource directory, and four sections none
+     of which is .rsrc. Quoted verbatim from ape/ape.S at master in 2.2. High
+     confidence — but master moves, so re-check against the version actually in
+     use rather than assuming.
+
+11.4 (UNVERIFIED, MATTERS FOR APPROACH) Does APE self-modification /
+     assimilation rewrite the PE header region on first run, and would it
+     destroy a resource directory added by post-processing? If yes, that is a
+     decisive argument for the ape.S route over any rcedit-style approach.
+
+11.5 (MEDIUM CONFIDENCE) The exact GRPICONDIR / GRPICONDIRENTRY layout in 3.1 —
+     specifically that the trailing u32 imageOffset of an on-disk ICONDIRENTRY
+     becomes a u16 resource id, making the entry 14 bytes rather than 16.
+     Believed correct and it is the crux of the .ico-to-resource transformation,
+     so confirm against the PE/COFF specification before writing the tool.
+
+11.6 (KNOWN-FLUID) Compositor support for xdg-toplevel-icon-v1. Confirmed: the
+     protocol exists in wayland-protocols as staging, and SDL implemented it in
+     March 2024. NOT confirmed: which compositor versions ship it. Check against
+     the specific targets that matter and treat it as an enhancement path with
+     the set_app_id route as the baseline.
+
+11.7 (KNOWN-AMBIGUOUS) Whether _NET_WM_ICON alpha is premultiplied. The EWMH
+     text is not explicit; non-premultiplied is the common reading. Test against
+     both a GTK-based and a Qt-based environment; dark or haloed icon edges are
+     the symptom of getting it backwards.
+
+11.8 (MEDIUM CONFIDENCE) That macOS custom-icon xattrs survive code signing
+     because signatures cover only the data fork. Reported by multiple sources
+     and consistent with how quarantine flags behave. Only matters if 7.2 is
+     pursued, which is not recommended.
+
+11.9 (NOT RESEARCHED, POSSIBLY A BLOCKER FOR THE WHOLE PREMISE) Can this crate
+     even be built as an APE? Cosmopolitan is a C toolchain (cosmocc) and there
+     is no official Rust target for it. softer_gui is Rust, pinned to 1.94.0,
+     currently targeting x86_64-unknown-linux-musl. If the intent is to ship
+     softer_gui itself as an APE .com, that is a substantial and unexamined
+     question that dwarfs the icon problem — and if the APE in question is a
+     different program, then only sections 4 and 6 of this document apply to
+     this crate at all. WORTH SETTLING BEFORE ANY OF THIS IS SCHEDULED.
+
+
+================================================================================
+12. SOURCES
+================================================================================
+
+  ape/ape.S and ape/ape.lds, jart/cosmopolitan @ master, fetched 2026-08-24
+     https://github.com/jart/cosmopolitan/blob/master/ape/ape.S
+     https://github.com/jart/cosmopolitan/blob/master/ape/ape.lds
+  APE specification
+     https://github.com/jart/cosmopolitan/blob/master/ape/specification.md
+     https://justine.lol/ape.html
+  XDG toplevel icon protocol
+     https://wayland.app/protocols/xdg-toplevel-icon-v1
+  SDL Wayland xdg-toplevel-icon-v1 support (2024-03-28)
+     https://discourse.libsdl.org/t/sdl-wayland-add-support-for-setting-window-icons-via-the-xdg-toplevel-icon-v1-protocol/53896
+  GLFW Wayland window icon issue
+     https://github.com/glfw/glfw/issues/2597
+  macOS custom Finder icons and resource forks
+     https://eclecticlight.co/2023/03/04/custom-finder-icons-resources-and-mac-os-history/
+     https://github.com/mklement0/fileicon
+  PE resources background
+     https://lief.re/doc/latest/tutorials/07_pe_resource.html
+  PE resource editors considered and rejected for APE (3.4)
+     https://github.com/Systemcluster/editpe
+
+================================================================================
+END
+================================================================================

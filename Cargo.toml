@@ -1,0 +1,13 @@
+[package]
+name = "softer_gui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+
+[dependencies]
+
+[profile.release]
+debug = 2
+codegen-units = 1
+lto = "fat"
+panic = "abort"
