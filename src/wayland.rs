@@ -229,6 +229,7 @@ struct Pump {
     axis_v: i32, axis_h: i32, axis_v120: Option<i32>, axis_h120: Option<i32>, axis_dirty: bool,
     pinch_scale: i32,
     last_seq: u64, first_present: bool,
+    debug: bool,
     cursor_applied: bool, fs_applied: bool,
     sync_done: Option<u32>,
 }
@@ -559,11 +560,30 @@ impl Pump {
                         a.u(); a.u(); a.u();
                         let refresh = a.u(); let seq = ((a.u() as u64) << 32) | a.u() as u64;
                         if refresh != 0 { self.core.set_period_fs(refresh as u64 * 1_000_000); }
-                        let frames = if self.first_present || seq <= self.last_seq { 1 } else { seq - self.last_seq };
-                        self.first_present = false; self.last_seq = seq;
+                        // Count vblanks, never presents. A retire against a vblank we have
+                        // already counted (seq unchanged, or out of order) showed nothing new
+                        // and must not advance the clock -- same rule as X11's same-msc COPY.
+                        // A compositor that reports no sequence at all leaves seq at 0 forever;
+                        // there one tick per presented frame is the best available clock.
+                        let frames = if self.first_present || (seq == 0 && self.last_seq == 0) { 1 }
+                                     else { seq.saturating_sub(self.last_seq) };
+                        if self.debug && !self.first_present && frames != 1 {
+                            eprintln!("[{}] wayland presented: seq {seq} last {} -> {frames} periods",
+                                      (now / 1_000_000) % 100_000, self.last_seq);
+                        }
+                        self.first_present = false;
+                        if seq > self.last_seq { self.last_seq = seq; }
                         self.frame_done(frames);
                     }
-                    _ => { fbs.remove(pos); drop(fbs); self.frame_done(1); }   // discarded
+                    // discarded: this content never reached a screen. Ticking for it would
+                    // count the period twice -- once here and again in the seq delta of the
+                    // next present, which still spans it -- and the app's motion would run
+                    // ahead of the wall clock by however long the compositor withheld frames.
+                    _ => {
+                        fbs.remove(pos); drop(fbs);
+                        if self.debug { eprintln!("[{}] wayland feedback discarded", (now / 1_000_000) % 100_000); }
+                        self.frame_done(0);
+                    }
                 }
                 return;
             }
@@ -797,7 +817,9 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
         keymap: xkb::Keymap::default(), mods: 0, group: 0,
         ptr_surf: 0, ptr_x: 0, ptr_y: 0, ptr_enter_serial: 0, ptr_serial: 0, cursor_shape: 0, cursor_surf: 0, cursor_mem: None, frame_mem: None,
         axis_v: 0, axis_h: 0, axis_v120: None, axis_h120: None, axis_dirty: false, pinch_scale: 1 << 16,
-        last_seq: 0, first_present: true, cursor_applied: false, fs_applied: false, sync_done: None,
+        last_seq: 0, first_present: true,
+        debug: std::env::var("SOFTER_GUI_DEBUG").is_ok(),
+        cursor_applied: false, fs_applied: false, sync_done: None,
     };
     // wl_display.get_registry, one round-trip for the globals, a second for what binding them triggers
     // (seat capabilities, output modes).
