@@ -27,12 +27,98 @@ this crate's event model.
 
 
 ================================================================================
+PREMISE UPDATE — 2026-08-24, AFTER THIS DOCUMENT WAS FIRST WRITTEN
+================================================================================
+
+Read this before section 0. Two things happened that falsify parts of what
+follows, and the corrections are not cosmetic — they change what the Windows
+backend IS, not merely which APIs it calls.
+
+(U1) softer_gui NOW BUILDS AS A COSMOPOLITAN APE.
+     ICON_RESEARCH.txt open question 11.9 — "can this crate even be built as an
+     APE" — is ANSWERED: yes. See cargo_cosmo (ShieldedLabs/cargo_cosmo) and this
+     repo's src/sys_cosmo.rs, selected by cfg(cosmo). That makes the Windows
+     question live in a way it was not when this was written, because a fat
+     APE's x86-64 half lands on Windows whether or not a backend exists.
+
+(U2) THERE ARE NOW TWO DELIVERY PATHS, AND THEY IMPOSE OPPOSITE CONSTRAINTS.
+     Almost every "constraint" in sections 2, 3, 4 and 14 was derived assuming
+     path A. Under path B several of them invert.
+
+     PATH A — a native x86_64-pc-windows-msvc build.
+        Everything in this document applies as written. Rust std targets
+        Windows directly, so std's floor (Windows 10) binds, target_os is
+        "windows", and #[link] / extern "system" is the way in.
+
+     PATH B — the cosmo APE.
+        std is compiled for LINUX-MUSL and never sees Windows at all; cosmo's
+        libc emulates POSIX over Win32 underneath. Consequences:
+
+        - RUST'S WINDOWS 10 FLOOR DOES NOT APPLY. std's target support is
+          irrelevant because std is not a Windows binary. The floor becomes
+          (a) whichever Windows cosmopolitan itself supports, and (b) which
+          Win32/DXGI entry points YOU call. Section 2's tier table is a path-A
+          artifact. Under path B the floor is a design choice again, and the
+          DXGI-versus-GDI reasoning in sections 5 and 8 becomes the ONLY thing
+          setting it.
+
+        - #[cfg(target_os = "windows")] WILL NEVER BE TRUE. target_os is
+          "linux". A Windows backend CANNOT be selected at compile time; it has
+          to be chosen at RUN time. Cosmopolitan publishes the host as an
+          extern int bitmask:
+
+              extern "C" { static __hostos: c_int; }
+              const HOST_LINUX:   c_int = 1;
+              const HOST_METAL:   c_int = 2;
+              const HOST_WINDOWS: c_int = 4;
+              const HOST_XNU:     c_int = 8;
+              // openbsd 16, freebsd 32, netbsd 64
+
+          (Verified against cargo_cosmo's examples/cross-os-probe and libcosmo.a.)
+          src/sys_cosmo.rs is where that dispatch belongs. Practically: one
+          binary carries the X11, Wayland AND Win32 backends, and picks among
+          them after the kernel is known. Section 15's build order assumes a
+          compile-time backend and needs rethinking for this.
+
+        - #[link(name = "user32")] IS NOT THE WAY IN. Section 4 is a path-A
+          section. Under cosmo, Win32 must be reached through cosmo's own
+          dlopen / NT bridging. The zero-dependency rule is unaffected — it is
+          still no crates — but the mechanism in 4.2 and the COM vtable work in
+          4.3 have to go through that bridge rather than import libraries.
+          Section 3's underlying point (Windows has no stable syscall ABI, the
+          DLL export is the boundary) still holds; only the route changes.
+
+        - TOOLCHAIN CONFLICT, UNRESOLVED. cargo_cosmo is pinned to a NIGHTLY
+          toolchain and cannot be otherwise (-Zbuild-std and custom JSON target
+          specs are nightly-only). This crate pins stable 1.94.0 deliberately,
+          with rust-toolchain.toml calling that pin "the stability guarantee".
+          Shipping softer_gui as an APE means giving that up. That is a
+          project-level decision, not a technical one, and it is not yet made.
+
+     WHICH PATH IS NOT SETTLED. Section 14 should be read as covering path A
+     only. Nothing else in this document has been re-derived for path B.
+
+(U3) WHAT IS UNCHANGED. Everything about PRESENTATION and PACING — sections 5
+     through 9 — is about which Win32/DXGI calls to make and in what order, and
+     is equally true on both paths. In particular the central finding stands:
+     GDI supplies no timing information at any Windows version, so a DXGI
+     flip-model swapchain is the only route to the vblank-exact display clock
+     this crate is built around. Sections 6 and 7 (one CPU buffer, damage never
+     leaving the process) are likewise path-independent.
+
+
+================================================================================
 0. EXECUTIVE SUMMARY — THE FINDINGS THAT ACTUALLY BIND
 ================================================================================
 
 Five findings dominate everything else. If you read nothing else, read these.
+NOTE: finding 0.1 below is superseded for the cosmo path — see PREMISE UPDATE
+(U2) above.
 
 (0.1) RUST'S OWN WINDOWS FLOOR IS WINDOWS 10, NOT WINDOWS 95.
+      [SUPERSEDED FOR THE COSMO PATH — see PREMISE UPDATE (U2). This holds for a
+      native windows-msvc build; under cosmo, std never targets Windows and this
+      floor does not apply.]
       The stated ambition was "one binary running on as many versions of Windows
       as possible." For a C program that is achievable down to Windows 95. For
       this crate it is not, because Rust's std dropped support for Windows 7/8/
@@ -1200,7 +1286,9 @@ Everything in this document came from a design discussion, not from compiling
 anything against a current SDK. The items below are the ones where a wrong detail
 would cost real time. Confidence is stated honestly.
 
- 17.1 (HIGH IMPACT, MEDIUM CONFIDENCE) The exact Rust release that dropped
+ 17.1 [PATH A ONLY. Irrelevant under cosmo, where std is compiled for
+      linux-musl and never targets Windows — see PREMISE UPDATE (U2).]
+      (HIGH IMPACT, MEDIUM CONFIDENCE) The exact Rust release that dropped
       Windows 7/8 support — stated here as 1.78 — and the current tier and name
       of the *-win7-windows-msvc targets. Check the Rust platform-support page.
       This determines the whole floor question (Q2), so verify it FIRST.

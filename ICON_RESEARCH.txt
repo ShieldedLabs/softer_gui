@@ -785,8 +785,16 @@ Steps 1-3 are days. Steps 5-6 are the open-ended part.
      and consistent with how quarantine flags behave. Only matters if 7.2 is
      pursued, which is not recommended.
 
-11.9 (NOT RESEARCHED, POSSIBLY A BLOCKER FOR THE WHOLE PREMISE) Can this crate
-     even be built as an APE? Cosmopolitan is a C toolchain (cosmocc) and there
+11.9 [RESOLVED 2026-08-24 — YES. softer_gui now builds as a fat x86-64+arm64
+     APE via cargo_cosmo (ShieldedLabs/cargo_cosmo); see src/sys_cosmo.rs,
+     selected by cfg(cosmo). The toolchain tension below is real and NOT
+     resolved: cargo_cosmo forces a nightly pin, this crate pins stable 1.94.0
+     as a deliberate stability guarantee, so shipping as an APE costs that.
+     Note also that under cosmo target_os is "linux", so a Windows GUI backend
+     cannot be cfg-selected — it must dispatch at run time on cosmo's __hostos
+     (HOST_WINDOWS = 4). See WINDOWS_RESEARCH.txt PREMISE UPDATE.]
+     Original entry: (NOT RESEARCHED, POSSIBLY A BLOCKER FOR THE WHOLE PREMISE)
+     Can this crate even be built as an APE? Cosmopolitan is a C toolchain (cosmocc) and there
      is no official Rust target for it. softer_gui is Rust, pinned to 1.94.0,
      currently targeting x86_64-unknown-linux-musl. If the intent is to ship
      softer_gui itself as an APE .com, that is a substantial and unexamined
