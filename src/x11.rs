@@ -38,6 +38,8 @@ pub struct Shared {
     sync_counter: u32,
     sync_want: AtomicU64,
     sync_done: AtomicU64,
+    /// (w<<32|h) of the ConfigureNotify that followed the pending sync request; 0 = not yet configured.
+    sync_size: AtomicU64,
     pixmap: [AtomicU32; 2],
     present_serial: AtomicU32,
 }
@@ -48,6 +50,8 @@ struct Buf { mem: ShmMem, seg: u32, pixmap: u32 }
 pub struct App {
     sh: Arc<Shared>,
     core: Arc<Core>,
+    /// Window size the frame being drawn was laid out for.
+    frame_w: u32, frame_h: u32,
     side: u32,
     generation: u64,
     cur: usize,
@@ -133,6 +137,7 @@ impl App {
         }
         if self.core.busy[self.cur].load(Acquire) { return None; }
         let b = self.bufs[self.cur].as_ref()?;
+        self.frame_w = w; self.frame_h = h;
         Some((b.mem.ptr as *mut u32, self.side, (self.generation << 1) | self.cur as u64))
     }
     pub fn submit(&mut self) {
@@ -151,16 +156,21 @@ impl App {
         self.core.busy[self.cur].store(true, Release);
         self.core.in_flight.fetch_add(1, AcqRel);
         self.cur ^= 1;
-        // _NET_WM_SYNC_REQUEST: the frame for the WM's last requested size is now
-        // queued, so release its brake. Acking one frame early is only ever as bad
-        // as not implementing the protocol at all.
+        // _NET_WM_SYNC_REQUEST: the WM sent a request, then the ConfigureNotify; it now
+        // waits for the counter before its next resize step. Release it only when the
+        // frame just queued was laid out for THAT configured size — a frame that was
+        // already in progress at the old size must not count, or the WM runs ahead of
+        // what is on screen and the drag shows stale, clipped frames.
         let want = sh.sync_want.load(Acquire);
-        if sh.sync_counter != 0 && want != sh.sync_done.load(Relaxed) {
+        let cfg = sh.sync_size.load(Acquire);
+        if sh.sync_counter != 0 && want != sh.sync_done.load(Relaxed) && cfg != 0
+            && cfg == ((self.frame_w as u64) << 32 | self.frame_h as u64) {
             let mut b = Vec::new();
             b.extend_from_slice(&u32b(sh.sync_counter));
             b.extend_from_slice(&u32b((want >> 32) as u32)); b.extend_from_slice(&u32b(want as u32));
             sh.conn.req(sh.ext.sync, 3, &b);
             sh.sync_done.store(want, Relaxed);
+            sh.sync_size.store(0, Relaxed);
         }
         sh.conn.flush();
     }
@@ -400,6 +410,10 @@ impl Pump {
                     self.core.full_redraw.store(true, Relaxed);
                     if self.core.in_flight.load(Acquire) == 0 { self.core.push_render(); }
                 }
+                // The configure that answers a pending sync request names the size the WM is waiting on.
+                if !synthetic && w != 0 && h != 0 && self.sh.sync_want.load(Acquire) != self.sh.sync_done.load(Acquire) {
+                    self.sh.sync_size.store((w as u64) << 32 | h as u64, Release);
+                }
             }
             33 => {   // ClientMessage
                 if rd32(p, 8) == self.atoms.wm_protocols {
@@ -407,6 +421,7 @@ impl Pump {
                     if proto == self.atoms.wm_delete { self.core.push_close(); }
                     else if proto == self.atoms.net_wm_sync && self.atoms.net_wm_sync != 0 {
                         let v = rd32(p, 20) as u64 | ((rd32(p, 24) as u64) << 32);
+                        self.sh.sync_size.store(0, Relaxed);   // the matching ConfigureNotify is still to come
                         self.sh.sync_want.store(v, Release);
                     }
                 }
@@ -698,7 +713,7 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
 
     let sh = Arc::new(Shared {
         conn, win, ext, sync_counter,
-        sync_want: AtomicU64::new(0), sync_done: AtomicU64::new(0),
+        sync_want: AtomicU64::new(0), sync_done: AtomicU64::new(0), sync_size: AtomicU64::new(0),
         pixmap: [AtomicU32::new(0), AtomicU32::new(0)], present_serial: AtomicU32::new(1),
     });
     let mut pump = Pump {
@@ -713,5 +728,5 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
     if pump.keymap.keys.is_empty() { eprintln!("softer_gui: no XKB keymap; text input will be empty"); }
     std::thread::Builder::new().name("softer_gui-x11-pump".into()).spawn(move || pump.run()).ok()?;
 
-    Some(App { sh, core, side: 0, generation: 0, cur: 0, bufs: [None, None] })
+    Some(App { sh, core, frame_w: 0, frame_h: 0, side: 0, generation: 0, cur: 0, bufs: [None, None] })
 }
