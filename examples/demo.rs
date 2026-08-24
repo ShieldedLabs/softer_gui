@@ -43,11 +43,7 @@ fn make_icon(side: u32) -> softer_gui::icon::OwnedIcon {
 }
 
 fn main() {
-    let sizes: Vec<u32> = match std::env::var("SOFTER_GUI_ICON_SIZES") {
-        Ok(v) => v.split(',').filter_map(|s| s.trim().parse().ok()).collect(),
-        Err(_) => vec![16, 24, 32, 48, 64, 128, 256],
-    };
-    let icons: Vec<softer_gui::icon::OwnedIcon> = sizes.iter().map(|s| make_icon(*s)).collect();
+    let icons: Vec<softer_gui::icon::OwnedIcon> = [16u32, 24, 32, 48, 64, 128, 256].iter().map(|s| make_icon(*s)).collect();
 
     // Desktop integration is opt-in and explicit: it writes files into $HOME, so
     // the user asks for it rather than getting it for having run the program.

@@ -92,38 +92,130 @@ fn chunk(out: &mut Vec<u8>, ty: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(&crc.to_be_bytes());
 }
 
-/// Encode one image as a PNG (8-bit RGBA, no interlacing).
+/// A deflate bit sink. Bits go out LSB-first within a byte; Huffman codes are
+/// defined MSB-first, so [`Bits::code`] reverses before writing. Getting those
+/// two orders the wrong way round is the classic deflate bug.
+struct Bits { out: Vec<u8>, acc: u32, n: u32 }
+
+impl Bits {
+    fn new() -> Bits { Bits { out: Vec::new(), acc: 0, n: 0 } }
+    fn put(&mut self, v: u32, len: u32) {
+        self.acc |= v << self.n;
+        self.n += len;
+        while self.n >= 8 { self.out.push(self.acc as u8); self.acc >>= 8; self.n -= 8; }
+    }
+    fn code(&mut self, v: u32, len: u32) {
+        let mut r = 0u32;
+        for i in 0..len { r |= ((v >> i) & 1) << (len - 1 - i); }
+        self.put(r, len);
+    }
+    fn flush(&mut self) { if self.n > 0 { self.out.push(self.acc as u8); self.acc = 0; self.n = 0; } }
+}
+
+// RFC 1951 section 3.2.5. Index i is length code 257+i / distance code i.
+const LEN_BASE: [u16; 29] = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+const LEN_EXTRA: [u32; 29] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+const DIST_BASE: [u16; 30] = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+const DIST_EXTRA: [u32; 30] = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+
+/// The fixed Huffman code for a literal/length symbol (RFC 1951 section 3.2.6).
+fn fixed_lit(sym: u32) -> (u32, u32) {
+    match sym {
+        0..=143 => (0x30 + sym, 8),
+        144..=255 => (0x190 + sym - 144, 9),
+        256..=279 => (sym - 256, 7),
+        _ => (0xc0 + sym - 280, 8),
+    }
+}
+
+/// Deflate with the FIXED Huffman tables and greedy LZ77 matching.
 ///
-/// The zlib stream uses STORED deflate blocks — i.e. no compression at all. A
-/// real deflate encoder is several hundred lines and a Huffman table, to save
-/// perhaps 60 % of a file that is measured in tens of kilobytes and written
-/// once, at install time, to the user's home directory. Stored blocks are
-/// perfectly legal zlib and every PNG reader accepts them.
+/// Fixed rather than dynamic tables: dynamic would win maybe another 20 % but
+/// costs the whole code-length-code encoder for a file written once at install
+/// time. The matching is what actually matters here — an icon is mostly flat
+/// colour, which becomes a handful of very long matches, and stored blocks made
+/// a 1024x1024 .icns entry 4 MiB on its own.
+fn deflate(data: &[u8]) -> Vec<u8> {
+    const HASH_BITS: usize = 15;
+    const WINDOW: usize = 32768;
+    let mut head = vec![u32::MAX; 1 << HASH_BITS];
+    let mut b = Bits::new();
+    b.put(1, 1);   // BFINAL
+    b.put(1, 2);   // BTYPE = 01, fixed Huffman
+
+    let h3 = |d: &[u8], i: usize| -> usize {
+        // Knuth multiplicative hash over three bytes; collisions only cost a
+        // missed match, never correctness, because every candidate is verified.
+        let v = (d[i] as u32) << 16 | (d[i + 1] as u32) << 8 | d[i + 2] as u32;
+        ((v.wrapping_mul(0x9E37_79B1)) >> (32 - HASH_BITS)) as usize
+    };
+
+    let mut i = 0usize;
+    while i < data.len() {
+        let mut best_len = 0usize;
+        let mut best_dist = 0usize;
+        if i + 3 <= data.len() {
+            let hv = h3(data, i);
+            let cand = head[hv];
+            head[hv] = i as u32;
+            if cand != u32::MAX {
+                let c = cand as usize;
+                let dist = i - c;
+                if dist <= WINDOW && dist > 0 {
+                    let max = (data.len() - i).min(258);
+                    let mut l = 0usize;
+                    while l < max && data[c + l] == data[i + l] { l += 1; }
+                    if l >= 3 { best_len = l; best_dist = dist; }
+                }
+            }
+        }
+        if best_len >= 3 {
+            let li = LEN_BASE.iter().rposition(|&v| v as usize <= best_len).unwrap();
+            let (c, n) = fixed_lit(257 + li as u32);
+            b.code(c, n);
+            b.put((best_len - LEN_BASE[li] as usize) as u32, LEN_EXTRA[li]);
+            let di = DIST_BASE.iter().rposition(|&v| v as usize <= best_dist).unwrap();
+            b.code(di as u32, 5);   // fixed distance codes are 5 bits, MSB-first
+            b.put((best_dist - DIST_BASE[di] as usize) as u32, DIST_EXTRA[di]);
+            // Insert the skipped positions so later matches can still find them.
+            for k in (i + 1)..(i + best_len).min(data.len().saturating_sub(2)) { head[h3(data, k)] = k as u32; }
+            i += best_len;
+        } else {
+            let (c, n) = fixed_lit(data[i] as u32);
+            b.code(c, n);
+            i += 1;
+        }
+    }
+    let (c, n) = fixed_lit(256);   // end of block
+    b.code(c, n);
+    b.flush();
+    b.out
+}
+
+/// Encode one image as a PNG (8-bit RGBA, no interlacing).
 pub fn encode_png(img: &IconImage) -> Vec<u8> {
     let side = img.side as usize;
 
-    // Raw scanlines: one filter byte (0 = None) then RGBA, top row first.
+    // Raw scanlines. Filter 1 (Sub) predicts each byte from the pixel to its
+    // left, so a flat run becomes a run of zeros — which is exactly what the
+    // LZ77 stage turns into one long match. Filter 0 would leave the colour
+    // repeating and cost far more.
     let mut raw = Vec::with_capacity(side * (side * 4 + 1));
     for y in 0..side {
-        raw.push(0);
+        raw.push(1);
         for x in 0..side {
             let p = img.argb[y * side + x];
-            raw.push((p >> 16) as u8);   // R
-            raw.push((p >> 8) as u8);    // G
-            raw.push(p as u8);           // B
-            raw.push((p >> 24) as u8);   // A
+            let cur = [(p >> 16) as u8, (p >> 8) as u8, p as u8, (p >> 24) as u8];
+            let left = if x == 0 { [0u8; 4] } else {
+                let q = img.argb[y * side + x - 1];
+                [(q >> 16) as u8, (q >> 8) as u8, q as u8, (q >> 24) as u8]
+            };
+            for k in 0..4 { raw.push(cur[k].wrapping_sub(left[k])); }
         }
     }
 
-    let mut z = vec![0x78, 0x01];   // CMF: deflate, 32 KiB window. FLG: no dict, fastest.
-    for (i, block) in raw.chunks(65535).enumerate() {
-        let last = (i + 1) * 65535 >= raw.len();
-        z.push(if last { 1 } else { 0 });
-        z.extend_from_slice(&(block.len() as u16).to_le_bytes());
-        z.extend_from_slice(&(!(block.len() as u16)).to_le_bytes());
-        z.extend_from_slice(block);
-    }
-    if raw.is_empty() { z.extend_from_slice(&[1, 0, 0, 0xff, 0xff]); }
+    let mut z = vec![0x78, 0x01];   // CMF: deflate, 32 KiB window. FLG: no dict.
+    z.extend_from_slice(&deflate(&raw));
     z.extend_from_slice(&adler32(&raw).to_be_bytes());
 
     let mut ihdr = Vec::with_capacity(13);
