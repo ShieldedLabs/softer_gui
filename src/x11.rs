@@ -146,6 +146,14 @@ impl App {
     pub fn submit(&mut self) {
         let sh = &self.sh;
         let Some(b) = self.bufs[self.cur].as_ref() else { return };
+        // The window changed size while this frame was being drawn: a frame for the wrong
+        // size is worse than none — presented into the new geometry it shows a clipped
+        // border or the square pixmap's stale pixels beyond the frame (a second, older
+        // border). The ConfigureNotify already pushed a RENDER, so the redraw is coming.
+        if self.frame_w != self.core.win_w.load(Relaxed) || self.frame_h != self.core.win_h.load(Relaxed) {
+            if sh.debug { eprintln!("[{}] submit: dropped {}x{} frame, window is now {}x{}", (sys::clock_monotonic_ns() / 1_000_000) % 100_000, self.frame_w, self.frame_h, self.core.win_w.load(Relaxed), self.core.win_h.load(Relaxed)); }
+            return;
+        }
         let serial = sh.present_serial.fetch_add(1, Relaxed);
         // PresentPixmap: everything optional zeroed — no fences, no target msc, next vblank.
         let mut r = Vec::with_capacity(72);
@@ -203,6 +211,9 @@ struct Pump {
     pinch_scale: i32,
     quit_seen: bool,
     debug: bool,
+    /// After acking a sync request: hold the next RENDER until the WM's configure lands
+    /// (deadline in ns), so the next frame is not started at a size about to change.
+    render_hold_until: u64,
 }
 
 impl Pump {
@@ -413,6 +424,7 @@ impl Pump {
                     // A new size wants a frame NOW, not at the next completion: during a drag
                     // every vblank of delay is a step the WM waits on. A second present in
                     // flight is fine — the msc gate still ticks once per vblank.
+                    self.render_hold_until = 0;
                     self.core.push_render();
                 }
                 // The configure that answers a pending sync request names the size the WM is waiting on.
@@ -452,7 +464,9 @@ impl Pump {
                     let mode = p[11]; let msc = rd64(p, 32); let serial = rd32(p, 20);
                     // The frame the WM's sync request was waiting on is on screen: release it.
                     let ack = self.sh.sync_ack_serial.load(Acquire);
+                    let mut acked = false;
                     if ack != 0 && serial >= ack {
+                        acked = true;
                         self.sh.sync_ack_serial.store(0, Relaxed);
                         let want = self.sh.sync_want.load(Acquire);
                         let mut b = Vec::new();
@@ -473,7 +487,11 @@ impl Pump {
                     // two presents permanently in flight (measured under Xwayland: the second
                     // retires as a frames==0 COPY, not a SKIP).
                     self.core.display_tick(frames);
-                    if mode != 2 && (frames != 0 || first) { self.core.push_render(); }
+                    if acked {
+                        // The WM resizes the instant it sees the counter; a frame started now would be
+                        // laid out for the size it is about to replace. Wait for its configure.
+                        self.render_hold_until = sys::clock_monotonic_ns() + self.core.period_fs() / 1_000_000;
+                    } else if mode != 2 && (frames != 0 || first) && self.render_hold_until == 0 { self.core.push_render(); }
                 }
                 2 => {   // IdleNotify
                     let pix = rd32(p, 24);
@@ -565,6 +583,10 @@ impl Pump {
             }
             let now = sys::clock_monotonic_ns();
             let mut timeout = self.core.repeat_tick(now);
+            if self.render_hold_until != 0 {
+                if now >= self.render_hold_until { self.render_hold_until = 0; self.core.push_render(); }
+                else { timeout = timeout.min(((self.render_hold_until - now) / 1_000_000).max(1) as i32); }
+            }
             self.apply_cursor();
             self.apply_icon();
             self.apply_fullscreen();
@@ -740,6 +762,7 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
         last_msc: 0, first_complete: true, win_root_x: 0, win_root_y: 0, crtc_rect: (0, 0, 0, 0),
         cursor_applied: false, fs_applied: false, scroll: Vec::new(), pinch_scale: 1 << 16, quit_seen: false,
         debug: std::env::var("SOFTER_GUI_DEBUG").is_ok(),
+        render_hold_until: 0,
     };
     pump.load_keymap();
     pump.query_devices();
