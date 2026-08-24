@@ -60,6 +60,12 @@ mod wayland;
 mod mac_sys;
 #[cfg(any(target_os = "macos", cosmo))]
 mod mac;
+#[cfg(target_os = "windows")]
+pub mod sys_win;
+#[cfg(target_os = "windows")]
+mod scancode_win;
+#[cfg(target_os = "windows")]
+mod win;
 
 pub use event::*;
 use std::sync::Arc;
@@ -75,6 +81,8 @@ enum Backend {
     Wayland(wayland::App),
     #[cfg(any(target_os = "macos", cosmo))]
     Mac(mac::App),
+    #[cfg(target_os = "windows")]
+    Win(win::App),
 }
 
 pub struct Gui {
@@ -130,6 +138,11 @@ pub fn open(title: &str, app_id: &str, width: u32, height: u32) -> Option<Gui> {
         let _ = app_id;
         open_mac(core, title, width, height)
     }
+    #[cfg(target_os = "windows")]
+    {
+        let app = win::open(core.clone(), title, app_id, width, height)?;
+        Some(Gui { core, back: Backend::Win(app) })
+    }
 }
 
 #[cfg(any(target_os = "macos", cosmo))]
@@ -160,6 +173,8 @@ impl Gui {
             Backend::Wayland(a) => a.get_framebuffer(),
             #[cfg(any(target_os = "macos", cosmo))]
             Backend::Mac(a) => a.get_framebuffer(),
+            #[cfg(target_os = "windows")]
+            Backend::Win(a) => a.get_framebuffer(),
         };
         let Some((ptr, side, key)) = got else { return Framebuffer { pixels: core::ptr::null_mut(), side: 0, width: 0, height: 0, key: 0 } };
         let side = side as usize;
@@ -176,6 +191,8 @@ impl Gui {
             Backend::Wayland(a) => a.submit(),
             #[cfg(any(target_os = "macos", cosmo))]
             Backend::Mac(a) => a.submit(),
+            #[cfg(target_os = "windows")]
+            Backend::Win(a) => a.submit(),
         }
     }
 
@@ -196,6 +213,8 @@ impl Gui {
         match &self.back {
             #[cfg(target_os = "linux")]
             Backend::Wayland(a) => a.poke(),
+            #[cfg(target_os = "windows")]
+            Backend::Win(a) => a.poke(),
             #[allow(unreachable_patterns)]
             _ => {}
         }
