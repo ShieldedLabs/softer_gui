@@ -78,5 +78,25 @@ CVDisplayLink thread is the producer. Same polling API on every platform.
   yet run (no compositor / Mac on the development machine). `cargo check
   --target aarch64-apple-darwin` passes.
 
+## One universal binary (Cosmopolitan APE)
+
+With [cargo_cosmo](https://github.com/ShieldedLabs/cargo_cosmo) checked out next
+to this repo:
+
+```
+PATH=../cargo_cosmo/tools:../cargo_cosmo/toolchain/cosmocc/bin:$PATH \
+  cargo cosmo build --release --features cosmo --example demo
+sh target/cosmo/demo.com          # x86-64 + arm64 in one file
+```
+
+Under `cfg(cosmo)` (set by the driver) `src/sys_cosmo.rs` replaces the raw
+syscalls with calls into cosmo's libc, so cosmo picks syscall numbers, struct
+layouts and constants at load time for whatever host the file lands on; the
+X11/Wayland wire code is unchanged. Verified on Linux/X11 at the same 60.0010 Hz
+as the native build. The `cosmo` feature pulls in cargo_cosmo's `cosmo-compat`
+libc shim; this needs cargo_cosmo's pinned nightly (custom target specs), the
+stable pin here applies to native builds only. Off-Linux hosts are gated on
+cargo_cosmo's own cross-OS work — see its README.
+
 `SOFTER_GUI_X11=1` forces X11; `SOFTER_GUI_DEBUG=1` logs pump events.
 `examples/xtest.rs` drives a window with XTEST for headless testing.

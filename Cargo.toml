@@ -5,9 +5,20 @@ edition = "2024"
 rust-version = "1.94"
 
 [dependencies]
+# Only for `cargo cosmo` builds (a libc shim, not a dependency in the crates.io sense):
+# std's strerror_r contract vs cosmo's. Enabled by the `cosmo` feature.
+cosmo-compat = { path = "../cargo_cosmo/crates/cosmo-compat", optional = true }
+
+[features]
+cosmo = ["dep:cosmo-compat"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(cosmo)'] }
 
 [profile.release]
 debug = 2
 codegen-units = 1
 lto = "fat"
-panic = "abort"
+# unwind, not abort: cargo_cosmo builds std with panic_unwind only (cosmo ships the
+# full _Unwind_* ABI), and a mismatched panic runtime fails to link there.
+panic = "unwind"

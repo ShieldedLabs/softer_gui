@@ -37,8 +37,14 @@ mod keysym_table;
 pub mod xkb;
 pub mod icon;
 pub mod install;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(cosmo)))]
 pub mod sys;
+/// Cosmopolitan build: the same interface over cosmo's libc, so one binary runs on any host.
+#[cfg(cosmo)]
+#[path = "sys_cosmo.rs"]
+pub mod sys;
+#[cfg(feature = "cosmo")]
+extern crate cosmo_compat as _;
 #[cfg(target_os = "linux")]
 mod shm;
 #[cfg(target_os = "linux")]

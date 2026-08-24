@@ -13,9 +13,9 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering::*};
 use crate::keysym;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(cosmo)))]
 fn now_ns() -> u64 { crate::sys::clock_monotonic_ns() }
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", not(cosmo))))]
 fn now_ns() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1) }
 
 pub const RING: usize = 256;
@@ -163,7 +163,7 @@ pub struct Core {
     /// Futex word: low 32 bits of head, bumped on every commit so the consumer can sleep on it.
     head_futex: AtomicU32,
     sleeping: AtomicU32,
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(target_os = "linux", not(cosmo))))]
     park: (std::sync::Mutex<()>, std::sync::Condvar),
     pump: UnsafeCell<PumpState>,
 
@@ -204,7 +204,7 @@ impl Core {
             tail: AtomicU64::new(0),
             head_futex: AtomicU32::new(0),
             sleeping: AtomicU32::new(0),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(all(target_os = "linux", not(cosmo))))]
             park: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
             pump: UnsafeCell::new(PumpState {
                 keybits: [0; 8],
@@ -260,9 +260,9 @@ impl Core {
         self.head.store(id + 1, Release);
         self.head_futex.fetch_add(1, Release);
         if self.sleeping.load(Acquire) != 0 {
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(cosmo)))]
             crate::sys::futex_wake(&self.head_futex, 1);
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(all(target_os = "linux", not(cosmo))))]
             { let _g = self.park.0.lock().unwrap(); self.park.1.notify_one(); }
         }
     }
@@ -492,9 +492,9 @@ impl Core {
         let seen = self.head_futex.load(Acquire);
         if self.has_events() { return; }
         self.sleeping.store(1, Release);
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(cosmo)))]
         if !self.has_events() { crate::sys::futex_wait(&self.head_futex, seen, timeout_ns); }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(all(target_os = "linux", not(cosmo))))]
         {
             let g = self.park.0.lock().unwrap();
             if !self.has_events() && self.head_futex.load(Acquire) == seen {

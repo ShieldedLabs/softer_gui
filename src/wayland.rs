@@ -758,10 +758,10 @@ impl Pump {
                 timeout = timeout.min(4);
             }
             self.sh.conn.flush();
-            let mut pfd = [sys::PollFd { fd, events: sys::POLLIN, revents: 0 }];
+            let mut pfd = [sys::PollFd { fd, events: sys::pollin(), revents: 0 }];
             let r = sys::poll(&mut pfd, timeout);
             if r < 0 && r != sys::EINTR { break; }
-            if pfd[0].revents & (sys::POLLERR | sys::POLLHUP) != 0 { break; }
+            if pfd[0].revents & (sys::pollerr() | sys::pollhup()) != 0 { break; }
         }
         self.core.push_close();
     }

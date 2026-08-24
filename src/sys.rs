@@ -96,6 +96,9 @@ pub struct PollFd { pub fd: i32, pub events: i16, pub revents: i16 }
 pub const POLLIN: i16 = 1;
 pub const POLLERR: i16 = 8;
 pub const POLLHUP: i16 = 16;
+#[inline] pub fn pollin() -> i16 { POLLIN }
+#[inline] pub fn pollerr() -> i16 { POLLERR }
+#[inline] pub fn pollhup() -> i16 { POLLHUP }
 
 #[repr(C)]
 pub struct IoVec { pub base: *mut u8, pub len: usize }
