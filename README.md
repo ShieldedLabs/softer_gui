@@ -93,7 +93,10 @@ whole of a modal resize drag. Same polling API on every platform.
   time locked to the display (6 s, 0 dropped vblanks, 0 duplicate timestamps, drift
   stable rather than accumulating); deliberately stalled frames reported as exactly
   the right number of whole periods; scancode table, layout text, shift, pointer,
-  wheel, resize/regrow and close all checked by `examples/wintest.rs`.
+  wheel, resize/regrow and close all checked by `examples/wintest.rs`. Content
+  keeps animating through a border drag: inside a real modal resize loop, where
+  DefWindowProc does not return, a timer drives the clock and delivered 42 RENDERs
+  in 1.2 s with strictly increasing timestamps and no faster than the display.
 * macOS: verified on macOS 15.7.2 / Apple Silicon, 120.0006 Hz — 17,313 frames
   with 0 skipped and 0 dropped vblanks, display time tracking wall clock to
   −14 ms over 144 s. The main-thread handoff, the IOSurface flip and the
