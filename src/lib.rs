@@ -53,7 +53,12 @@ pub mod x11_conn;
 mod x11;
 #[cfg(target_os = "linux")]
 mod wayland;
-#[cfg(target_os = "macos")]
+// An APE says target_os = "linux" whatever it is running on, so the macOS
+// backend is compiled in there too and chosen at run time; its foreign symbols
+// come from cosmo_dlopen instead of the linker (see mac_sys.rs).
+#[cfg(any(target_os = "macos", cosmo))]
+mod mac_sys;
+#[cfg(any(target_os = "macos", cosmo))]
 mod mac;
 
 pub use event::*;
@@ -68,7 +73,7 @@ enum Backend {
     X11(x11::App),
     #[cfg(target_os = "linux")]
     Wayland(wayland::App),
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", cosmo))]
     Mac(mac::App),
 }
 
@@ -96,10 +101,20 @@ impl Framebuffer {
 
 /// Open a window. `app_id` names the application for the desktop (WM_CLASS / xdg app_id,
 /// e.g. "com.example.app"; see `install`). Linux: Wayland first, X11 fallback
-/// (SOFTER_GUI_X11=1 forces X11). macOS: main thread only.
+/// (SOFTER_GUI_X11=1 forces X11). macOS: main thread only. In an APE the host
+/// is not known until the program starts, so the backend is picked here rather
+/// than by the compiler.
 pub fn open(title: &str, app_id: &str, width: u32, height: u32) -> Option<Gui> {
     let core = Arc::new(Core::new());
-    #[cfg(target_os = "linux")]
+    // An APE carries every backend and picks one here, from what cosmo says the
+    // host actually is. A native build has exactly one and the branch is gone at
+    // compile time.
+    #[cfg(cosmo)]
+    if mac_sys::on_macos() {
+        let _ = app_id;
+        return open_mac(core, title, width, height);
+    }
+    #[cfg(any(target_os = "linux", cosmo))]
     {
         let force_x11 = std::env::var("SOFTER_GUI_X11").map(|v| v == "1").unwrap_or(false);
         if !force_x11 {
@@ -110,14 +125,19 @@ pub fn open(title: &str, app_id: &str, width: u32, height: u32) -> Option<Gui> {
         let app = x11::open(core.clone(), title, app_id, width, height)?;
         Some(Gui { core, back: Backend::X11(app) })
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(cosmo)))]
     {
         let _ = app_id;
-        let (app, pump) = mac::open(core.clone(), title, width, height)?;
-        // From here on we are a different kernel thread: the main thread now belongs to AppKit.
-        if !mac::takeover_main_thread(pump) { return None; }
-        Some(Gui { core, back: Backend::Mac(app) })
+        open_mac(core, title, width, height)
     }
+}
+
+#[cfg(any(target_os = "macos", cosmo))]
+fn open_mac(core: Arc<Core>, title: &str, width: u32, height: u32) -> Option<Gui> {
+    let (app, pump) = mac::open(core.clone(), title, width, height)?;
+    // From here on we are a different kernel thread: the main thread now belongs to AppKit.
+    if !mac::takeover_main_thread(pump) { return None; }
+    Some(Gui { core, back: Backend::Mac(app) })
 }
 
 impl Gui {
@@ -138,7 +158,7 @@ impl Gui {
             Backend::X11(a) => a.get_framebuffer(),
             #[cfg(target_os = "linux")]
             Backend::Wayland(a) => a.get_framebuffer(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", cosmo))]
             Backend::Mac(a) => a.get_framebuffer(),
         };
         let Some((ptr, side, key)) = got else { return Framebuffer { pixels: core::ptr::null_mut(), side: 0, width: 0, height: 0, key: 0 } };
@@ -154,7 +174,7 @@ impl Gui {
             Backend::X11(a) => a.submit(),
             #[cfg(target_os = "linux")]
             Backend::Wayland(a) => a.submit(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", cosmo))]
             Backend::Mac(a) => a.submit(),
         }
     }

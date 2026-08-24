@@ -2,6 +2,12 @@
 //! row, and a frame-time HUD — plus pacing statistics on stdout (frames, dropped
 //! vblanks, display-vs-wall drift). ESC or the close button quits; F11 toggles
 //! fullscreen; hold the left mouse button to hide the native cursor.
+// The libc shims have to be referenced from the crate that is *linked*: pulling
+// them in from the library alone leaves the rlib ahead of std in the link order,
+// where nothing is undefined yet and the archive members are dropped.
+#[cfg(feature = "cosmo")]
+extern crate cosmo_compat as _;
+
 use softer_gui::*;
 
 fn fill(fb: &mut Framebuffer, x0: i64, y0: i64, x1: i64, y1: i64, c: u32) {

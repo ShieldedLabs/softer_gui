@@ -74,9 +74,17 @@ CVDisplayLink thread is the producer. Same polling API on every platform.
 
 * X11: verified on Xorg 60.0010 Hz — contiguous msc, one present per vblank,
   resize/regrow, text (layout groups, shift, repeat), XI2 scroll, buttons, cursor hide.
-* Wayland and macOS: written to the protocols/APIs from the brevis reference, not
-  yet run (no compositor / Mac on the development machine). `cargo check
-  --target aarch64-apple-darwin` passes.
+* macOS: verified on macOS 15.7.2 / Apple Silicon, 120.0006 Hz — 17,313 frames
+  with 0 skipped and 0 dropped vblanks, display time tracking wall clock to
+  −14 ms over 144 s. The main-thread handoff, the IOSurface flip and the
+  CVDisplayLink clock all work as written. Fixed while getting there:
+  `period_fs()` returned the 60 Hz default until the first display-link
+  callback, so a 120 Hz Mac reported 60 Hz to the app for the first frame.
+  Pointer tracking is verified (the cursor readout follows a warped pointer
+  1:1); keyboard, scroll, pinch, resize and fullscreen are written but not yet
+  exercised on the Mac, since driving them needs a human at the keyboard.
+* Wayland: written to the protocol from the brevis reference, not yet run (no
+  compositor on the development machine).
 
 ## One universal binary (Cosmopolitan APE)
 
@@ -95,8 +103,34 @@ layouts and constants at load time for whatever host the file lands on; the
 X11/Wayland wire code is unchanged. Verified on Linux/X11 at the same 60.0010 Hz
 as the native build. The `cosmo` feature pulls in cargo_cosmo's `cosmo-compat`
 libc shim; this needs cargo_cosmo's pinned nightly (custom target specs), the
-stable pin here applies to native builds only. Off-Linux hosts are gated on
-cargo_cosmo's own cross-OS work — see its README.
+stable pin here applies to native builds only.
+
+**That same file runs on macOS**, verified on macOS 15.7.2 / Apple Silicon:
+1,200 frames, 0 skipped, 0 dropped vblanks, 120.0006 Hz, −8.4 ms drift over
+10 s — the same numbers as the native Mac build.
+
+The backend is chosen at run time from cosmo's `__hostos`, because an APE says
+`target_os = "linux"` wherever it is running. `src/mac_sys.rs` holds the macOS
+foreign symbols twice: linked normally in a native build, resolved through
+`cosmo_dlopen`/`cosmo_dlsym`/`cosmo_dltramp` in an APE, behind one
+function-shaped API so `src/mac.rs` reads the same either way. Nothing is
+dlopen'd unless the program woke up on XNU, so the Linux path is untouched.
+
+Two things differ inside the APE, both forced by what cosmo can and cannot do
+across a foreign thread:
+
+* **The display-link callback only counts.** CoreVideo calls it on a thread
+  AppKit created, where cosmo-compiled code has no cosmo thread state, so the
+  callback is one relaxed atomic increment and a cosmo-owned thread does the
+  production. The vblank *count* stays exact; only the wake-up costs a sleep.
+* **Both cosmo threads are created before AppKit is activated.** Creating one
+  afterwards corrupts the creator (see cargo_cosmo's README — it is a cosmo
+  bug, not an ordering preference), so they are started early and parked on an
+  atomic until there is work.
+
+`cargo cosmo` overrides `codegen-units` and `lto` for APE builds; the release
+profile here sets both to values that break threads under cosmo. Native builds
+keep the profile as written.
 
 `SOFTER_GUI_X11=1` forces X11; `SOFTER_GUI_DEBUG=1` logs pump events.
 `examples/xtest.rs` drives a window with XTEST for headless testing.

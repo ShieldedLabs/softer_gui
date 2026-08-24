@@ -17,96 +17,38 @@ use std::sync::{Arc, Mutex};
 use crate::event::*;
 use crate::keysym;
 
-type id = *mut core::ffi::c_void;
-type SEL = *mut core::ffi::c_void;
-type Class = *mut core::ffi::c_void;
-type CFTypeRef = *const core::ffi::c_void;
-type CFStringRef = CFTypeRef;
-type Boolean = u8;
-
-#[repr(C)] #[derive(Clone, Copy, Default)] pub struct NSPoint { x: f64, y: f64 }
-#[repr(C)] #[derive(Clone, Copy, Default)] pub struct NSSize { w: f64, h: f64 }
-#[repr(C)] #[derive(Clone, Copy, Default)] pub struct NSRect { o: NSPoint, s: NSSize }
-#[repr(C)] #[derive(Clone, Copy)] pub struct CVTime { value: i64, scale: i32, flags: i32 }
-
-#[link(name = "objc")]
-unsafe extern "C" {
-    fn objc_getClass(name: *const u8) -> Class;
-    fn sel_registerName(name: *const u8) -> SEL;
-    fn objc_msgSend();
-    fn objc_allocateClassPair(sup: Class, name: *const u8, extra: usize) -> Class;
-    fn objc_registerClassPair(cls: Class);
-    fn class_addMethod(cls: Class, sel: SEL, imp: *const core::ffi::c_void, types: *const u8) -> Boolean;
-}
-#[link(name = "CoreFoundation", kind = "framework")]
-unsafe extern "C" {
-    fn CFRelease(r: CFTypeRef);
-    fn CFNumberCreate(alloc: CFTypeRef, ty: i64, ptr: *const core::ffi::c_void) -> CFTypeRef;
-    fn CFDictionaryCreate(alloc: CFTypeRef, keys: *const CFTypeRef, vals: *const CFTypeRef, n: i64, kcb: *const core::ffi::c_void, vcb: *const core::ffi::c_void) -> CFTypeRef;
-    fn CFDataGetBytePtr(d: CFTypeRef) -> *const u8;
-    static kCFTypeDictionaryKeyCallBacks: [u8; 0];
-    static kCFTypeDictionaryValueCallBacks: [u8; 0];
-}
-#[link(name = "IOSurface", kind = "framework")]
-unsafe extern "C" {
-    fn IOSurfaceCreate(props: CFTypeRef) -> CFTypeRef;
-    fn IOSurfaceGetBaseAddress(s: CFTypeRef) -> *mut u8;
-    fn IOSurfaceGetBytesPerRow(s: CFTypeRef) -> usize;
-    fn IOSurfaceLock(s: CFTypeRef, options: u32, seed: *mut u32) -> i32;
-    fn IOSurfaceUnlock(s: CFTypeRef, options: u32, seed: *mut u32) -> i32;
-    fn IOSurfaceIsInUse(s: CFTypeRef) -> Boolean;
-    static kIOSurfaceWidth: CFStringRef;
-    static kIOSurfaceHeight: CFStringRef;
-    static kIOSurfaceBytesPerElement: CFStringRef;
-    static kIOSurfaceBytesPerRow: CFStringRef;
-    static kIOSurfacePixelFormat: CFStringRef;
-}
-#[link(name = "CoreVideo", kind = "framework")]
-unsafe extern "C" {
-    fn CVDisplayLinkCreateWithCGDisplay(display: u32, out: *mut *mut core::ffi::c_void) -> i32;
-    fn CVDisplayLinkSetOutputCallback(link: *mut core::ffi::c_void, cb: extern "C" fn(*mut core::ffi::c_void, *const u8, *const u8, u64, *mut u64, *mut core::ffi::c_void) -> i32, user: *mut core::ffi::c_void) -> i32;
-    fn CVDisplayLinkStart(link: *mut core::ffi::c_void) -> i32;
-    fn CVDisplayLinkStop(link: *mut core::ffi::c_void) -> i32;
-    fn CVDisplayLinkSetCurrentCGDisplay(link: *mut core::ffi::c_void, display: u32) -> i32;
-    fn CVDisplayLinkGetNominalOutputVideoRefreshPeriod(link: *mut core::ffi::c_void) -> CVTime;
-    fn CVDisplayLinkGetActualOutputVideoRefreshPeriod(link: *mut core::ffi::c_void) -> f64;
-}
-#[link(name = "CoreGraphics", kind = "framework")]
-unsafe extern "C" { fn CGMainDisplayID() -> u32; }
-#[link(name = "QuartzCore", kind = "framework")]
-unsafe extern "C" { static kCAFilterNearest: id; }
-#[link(name = "AppKit", kind = "framework")]
-unsafe extern "C" {}
-#[link(name = "Carbon", kind = "framework")]
-unsafe extern "C" {
-    fn TISCopyCurrentKeyboardLayoutInputSource() -> CFTypeRef;
-    fn TISGetInputSourceProperty(src: CFTypeRef, key: CFStringRef) -> CFTypeRef;
-    fn LMGetKbdType() -> u8;
-    fn UCKeyTranslate(layout: *const u8, vk: u16, action: u16, mods: u32, kbd_type: u32, options: u32, dead: *mut u32, max: usize, actual: *mut usize, out: *mut u16) -> i32;
-    static kTISPropertyUnicodeKeyLayoutData: CFStringRef;
-}
+// Frameworks and the Objective-C runtime: linked directly in a native build,
+// looked up through cosmo_dlopen in an APE. Same names either way.
+use crate::mac_sys::*;
 
 // ---- objc_msgSend, typed per call shape ------------------------------------------
 fn cls(name: &str) -> Class { let c = format!("{name}\0"); unsafe { objc_getClass(c.as_ptr()) } }
 fn sel(name: &str) -> SEL { let s = format!("{name}\0"); unsafe { sel_registerName(s.as_ptr()) } }
-fn send0(r: id, s: SEL) -> id { let f: extern "C" fn(id, SEL) -> id = unsafe { core::mem::transmute(objc_msgSend as *const ()) }; f(r, s) }
-fn send1(r: id, s: SEL, a: id) -> id { let f: extern "C" fn(id, SEL, id) -> id = unsafe { core::mem::transmute(objc_msgSend as *const ()) }; f(r, s, a) }
-fn send_u(r: id, s: SEL, a: u64) -> id { let f: extern "C" fn(id, SEL, u64) -> id = unsafe { core::mem::transmute(objc_msgSend as *const ()) }; f(r, s, a) }
-fn send_f(r: id, s: SEL, a: f64) -> id { let f: extern "C" fn(id, SEL, f64) -> id = unsafe { core::mem::transmute(objc_msgSend as *const ()) }; f(r, s, a) }
+fn send0(r: id, s: SEL) -> id { let f: extern "C" fn(id, SEL) -> id = unsafe { core::mem::transmute(msg_send_ptr()) }; f(r, s) }
+fn send1(r: id, s: SEL, a: id) -> id { let f: extern "C" fn(id, SEL, id) -> id = unsafe { core::mem::transmute(msg_send_ptr()) }; f(r, s, a) }
+fn send_u(r: id, s: SEL, a: u64) -> id { let f: extern "C" fn(id, SEL, u64) -> id = unsafe { core::mem::transmute(msg_send_ptr()) }; f(r, s, a) }
+fn send_f(r: id, s: SEL, a: f64) -> id { let f: extern "C" fn(id, SEL, f64) -> id = unsafe { core::mem::transmute(msg_send_ptr()) }; f(r, s, a) }
 fn send_bool(r: id, s: SEL, a: bool) -> id { send_u(r, s, a as u64) }
-fn ret_f64(r: id, s: SEL) -> f64 { let f: extern "C" fn(id, SEL) -> f64 = unsafe { core::mem::transmute(objc_msgSend as *const ()) }; f(r, s) }
-fn ret_f32(r: id, s: SEL) -> f32 { let f: extern "C" fn(id, SEL) -> f32 = unsafe { core::mem::transmute(objc_msgSend as *const ()) }; f(r, s) }
+fn ret_f64(r: id, s: SEL) -> f64 { let f: extern "C" fn(id, SEL) -> f64 = unsafe { core::mem::transmute(msg_send_ptr()) }; f(r, s) }
+fn ret_f32(r: id, s: SEL) -> f32 { let f: extern "C" fn(id, SEL) -> f32 = unsafe { core::mem::transmute(msg_send_ptr()) }; f(r, s) }
 fn ret_u64(r: id, s: SEL) -> u64 { send0(r, s) as u64 }
-fn ret_rect(r: id, s: SEL) -> NSRect { let f: extern "C" fn(id, SEL) -> NSRect = unsafe { core::mem::transmute(objc_msgSend as *const ()) }; f(r, s) }
-fn ret_point(r: id, s: SEL) -> NSPoint { let f: extern "C" fn(id, SEL) -> NSPoint = unsafe { core::mem::transmute(objc_msgSend as *const ()) }; f(r, s) }
-fn send_rect(r: id, s: SEL, rect: NSRect) -> id { let f: extern "C" fn(id, SEL, NSRect) -> id = unsafe { core::mem::transmute(objc_msgSend as *const ()) }; f(r, s, rect) }
+fn ret_rect(r: id, s: SEL) -> NSRect { let f: extern "C" fn(id, SEL) -> NSRect = unsafe { core::mem::transmute(msg_send_ptr()) }; f(r, s) }
+fn ret_point(r: id, s: SEL) -> NSPoint { let f: extern "C" fn(id, SEL) -> NSPoint = unsafe { core::mem::transmute(msg_send_ptr()) }; f(r, s) }
+fn send_rect(r: id, s: SEL, rect: NSRect) -> id { let f: extern "C" fn(id, SEL, NSRect) -> id = unsafe { core::mem::transmute(msg_send_ptr()) }; f(r, s, rect) }
 fn nsdata(bytes: &[u8]) -> id {
-    let f: extern "C" fn(id, SEL, *const u8, u64) -> id = unsafe { core::mem::transmute(objc_msgSend as *const ()) };
+    let f: extern "C" fn(id, SEL, *const u8, u64) -> id = unsafe { core::mem::transmute(msg_send_ptr()) };
     f(cls("NSData"), sel("dataWithBytes:length:"), bytes.as_ptr(), bytes.len() as u64)
 }
-fn nsstring(s: &str) -> id { let c = format!("{s}\0"); let f: extern "C" fn(id, SEL, *const u8) -> id = unsafe { core::mem::transmute(objc_msgSend as *const ()) }; f(cls("NSString"), sel("stringWithUTF8String:"), c.as_ptr()) }
+fn nsstring(s: &str) -> id { let c = format!("{s}\0"); let f: extern "C" fn(id, SEL, *const u8) -> id = unsafe { core::mem::transmute(msg_send_ptr()) }; f(cls("NSString"), sel("stringWithUTF8String:"), c.as_ptr()) }
 
 extern "C" fn yes_imp(_this: id, _sel: SEL) -> Boolean { 1 }
+
+/// SOFTER_GUI_DEBUG=1 traces the macOS open sequence. Worth having: in an APE
+/// every one of these steps is a dlopen'd call that can fail differently from
+/// the native build.
+fn trace(what: &str) {
+    if std::env::var("SOFTER_GUI_DEBUG").is_ok() { eprintln!("softer_gui/mac: {what}"); }
+}
 
 // ---- IOSurface buffers -------------------------------------------------------------
 struct Surface { surf: CFTypeRef, addr: *mut u8 }
@@ -116,10 +58,10 @@ unsafe impl Sync for Surface {}
 fn make_surface(side: u32) -> Option<Surface> {
     unsafe {
         let nums: [i32; 5] = [side as i32, side as i32, 4, (side * 4) as i32, 0x42475241];   // 'BGRA'
-        let keys: [CFStringRef; 5] = [kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement, kIOSurfaceBytesPerRow, kIOSurfacePixelFormat];
+        let keys: [CFStringRef; 5] = [k_iosurface_width(), k_iosurface_height(), k_iosurface_bytes_per_element(), k_iosurface_bytes_per_row(), k_iosurface_pixel_format()];
         let mut vals: [CFTypeRef; 5] = [core::ptr::null(); 5];
         for i in 0..5 { vals[i] = CFNumberCreate(core::ptr::null(), 3, &nums[i] as *const i32 as *const _); }   // kCFNumberSInt32Type
-        let props = CFDictionaryCreate(core::ptr::null(), keys.as_ptr(), vals.as_ptr(), 5, kCFTypeDictionaryKeyCallBacks.as_ptr() as *const _, kCFTypeDictionaryValueCallBacks.as_ptr() as *const _);
+        let props = CFDictionaryCreate(core::ptr::null(), keys.as_ptr(), vals.as_ptr(), 5, cf_dict_key_callbacks(), cf_dict_value_callbacks());
         let surf = IOSurfaceCreate(props);
         CFRelease(props);
         for v in vals { CFRelease(v); }
@@ -238,7 +180,7 @@ impl Layout {
             let src = TISCopyCurrentKeyboardLayoutInputSource();
             let mut data = core::ptr::null();
             if !src.is_null() {
-                let d = TISGetInputSourceProperty(src, kTISPropertyUnicodeKeyLayoutData);
+                let d = TISGetInputSourceProperty(src, k_tis_unicode_key_layout_data());
                 if !d.is_null() { data = CFDataGetBytePtr(d); }
             }
             Layout { data, kbd_type: LMGetKbdType() as u32, dead: 0 }
@@ -265,12 +207,19 @@ impl Layout {
 // ---- CVDisplayLink: the vblank source AND the ring producer -------------------------------
 extern "C" fn link_callback(link: *mut core::ffi::c_void, _now: *const u8, _out: *const u8, _f: u64, _fo: *mut u64, user: *mut core::ffi::c_void) -> i32 {
     let sh: &Shared = unsafe { &*(user as *const Shared) };
+    produce(sh, link, 1);
+    0
+}
+
+/// One vblank's worth of production: advance the frame clock by `ticks` whole
+/// periods, poll the window, drain what the pump collected, stamp a RENDER.
+fn produce(sh: &Shared, link: *mut core::ffi::c_void, ticks: u32) {
     let core = &sh.core;
     // Nominal period: an exact rational for the mode; the actual one jitters ±µs and made motion shimmer.
     let t = unsafe { CVDisplayLinkGetNominalOutputVideoRefreshPeriod(link) };
     if t.scale != 0 && t.flags & 1 == 0 { core.set_period_fs((t.value as u128 * 1_000_000_000_000_000u128 / t.scale as u128) as u64); }
     else { let p = unsafe { CVDisplayLinkGetActualOutputVideoRefreshPeriod(link) }; if p > 0.0 { core.set_period_fs((p * 1e15) as u64); } }
-    core.display_tick(1);
+    core.display_tick(ticks as u64);
     core.service_resync();
     let now = sh.start.elapsed().as_nanos() as u64;
 
@@ -307,7 +256,47 @@ extern "C" fn link_callback(link: *mut core::ffi::c_void, _now: *const u8, _out:
     core.repeat_tick(now);
     core.in_flight.store(0, Relaxed);
     core.push_render();
+}
+
+// ---- the same vblank source, from an APE --------------------------------------------------
+// CoreVideo runs its callback on a thread AppKit created, and cosmo-compiled
+// code on a foreign thread has no cosmo TLS, no cosmo signal state and no
+// cosmo-owned stack. `produce` allocates, takes locks and formats strings, so
+// running it there is not safe. Under cfg(cosmo) the callback is therefore the
+// smallest thing that can carry the information across -- one relaxed
+// increment -- and a cosmo-owned thread does the production. The vblank COUNT
+// is still exact, which is what the frame clock is made of; only the wake-up
+// goes through a sleep.
+#[cfg(cosmo)]
+static VBLANKS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(cosmo)]
+extern "C" fn link_tick(_link: *mut core::ffi::c_void, _now: *const u8, _out: *const u8, _f: u64, _fo: *mut u64, _user: *mut core::ffi::c_void) -> i32 {
+    VBLANKS.fetch_add(1, Relaxed);
     0
+}
+
+#[cfg(cosmo)]
+fn spawn_producer(sh: Arc<Shared>) {
+    std::thread::Builder::new().name("softer_gui-vblank".into()).spawn(move || {
+        let mut seen = 0u64;
+        loop {
+            if sh.core.quit.load(Relaxed) { return }
+            // May be started before the display link exists: wait for it.
+            let link = sh.link.load(Relaxed) as *mut core::ffi::c_void;
+            if link.is_null() { std::thread::sleep(std::time::Duration::from_micros(300)); continue }
+            let now = VBLANKS.load(Relaxed);
+            if now == seen {
+                // A quarter of a 120 Hz period: short enough not to blur two
+                // vblanks together, long enough not to spin a core.
+                std::thread::sleep(std::time::Duration::from_micros(300));
+                continue;
+            }
+            let ticks = (now - seen).min(u32::MAX as u64) as u32;
+            seen = now;
+            produce(&sh, link, ticks);
+        }
+    }).expect("vblank thread");
 }
 
 // ---- main-thread pump ------------------------------------------------------------------
@@ -352,14 +341,14 @@ impl Pump {
     /// Block up to `ms` for an NSEvent to become available (peek, no dequeue); pump_once then takes it.
     pub fn block_ms(&mut self, ms: u64) {
         let date = send_f(cls("NSDate"), sel("dateWithTimeIntervalSinceNow:"), ms as f64 / 1000.0);
-        let f: extern "C" fn(id, SEL, u64, id, id, bool) -> id = unsafe { core::mem::transmute(objc_msgSend as *const ()) };
+        let f: extern "C" fn(id, SEL, u64, id, id, bool) -> id = unsafe { core::mem::transmute(msg_send_ptr()) };
         f(self.app, self.sel_next_event, u64::MAX, date, self.run_loop_mode, false);
     }
 
     pub fn pump_once(&mut self) {
         let core = &self.sh.core;
         loop {
-            let f: extern "C" fn(id, SEL, u64, id, id, bool) -> id = unsafe { core::mem::transmute(objc_msgSend as *const ()) };
+            let f: extern "C" fn(id, SEL, u64, id, id, bool) -> id = unsafe { core::mem::transmute(msg_send_ptr()) };
             let ev = f(self.app, self.sel_next_event, u64::MAX, self.date_distant_past, self.run_loop_mode, true);
             if ev.is_null() { break; }
             let ty = ret_u64(ev, self.sel_type);
@@ -427,6 +416,11 @@ impl Pump {
 /// Open the window (main thread only). Returns the consumer-side App and the main-thread Pump.
 pub fn open(core: Arc<Core>, title: &str, width: u32, height: u32) -> Option<(App, Pump)> {
     unsafe {
+        // In an APE this is where AppKit, IOSurface, CoreVideo and the ObjC
+        // runtime actually get loaded; natively it is a no-op returning true.
+        if !load() { eprintln!("softer_gui: no macOS frameworks on this host"); return None; }
+        drop_std_fault_handlers();
+        trace("frameworks loaded");
         let app = send0(cls("NSApplication"), sel("sharedApplication"));
         send_u(app, sel("setActivationPolicy:"), 0);
         // An NSWindow subclass whose canBecomeKeyWindow answers YES, so a borderless (fullscreen) window keeps the keyboard.
@@ -438,7 +432,7 @@ pub fn open(core: Arc<Core>, title: &str, width: u32, height: u32) -> Option<(Ap
             win_cls = fs_cls;
         }
         let win = send0(win_cls, sel("alloc"));
-        let f: extern "C" fn(id, SEL, NSRect, u64, u64, bool) -> id = core::mem::transmute(objc_msgSend as *const ());
+        let f: extern "C" fn(id, SEL, NSRect, u64, u64, bool) -> id = core::mem::transmute(msg_send_ptr());
         let win = f(win, sel("initWithContentRect:styleMask:backing:defer:"), NSRect { o: NSPoint { x: 0.0, y: 0.0 }, s: NSSize { w: width as f64, h: height as f64 } }, 15, 2, false);
         if win.is_null() { return None; }
         send_bool(win, sel("setReleasedWhenClosed:"), false);
@@ -452,9 +446,10 @@ pub fn open(core: Arc<Core>, title: &str, width: u32, height: u32) -> Option<(Ap
         let scale = ret_f64(win, sel_backing_scale).max(1.0);
         // Native device pixels: the layer maps surface pixels 1:1, never smoothed.
         send_f(layer, sel_contents_scale, scale);
-        send1(layer, sel("setMagnificationFilter:"), kCAFilterNearest);
-        send1(layer, sel("setMinificationFilter:"), kCAFilterNearest);
+        send1(layer, sel("setMagnificationFilter:"), ca_filter_nearest());
+        send1(layer, sel("setMinificationFilter:"), ca_filter_nearest());
         send_bool(win, sel("setAcceptsMouseMovedEvents:"), true);
+        trace("window built");
 
         core.win_w.store((width as f64 * scale) as u32, Relaxed);
         core.win_h.store((height as f64 * scale) as u32, Relaxed);
@@ -473,6 +468,13 @@ pub fn open(core: Arc<Core>, title: &str, width: u32, height: u32) -> Option<(Ap
             cls_catransaction: cls("CATransaction"),
         });
 
+        trace("shared built");
+        // Both cosmo threads are created here, before finishLaunching and the
+        // display link: see the note on ADOPT_CTX.
+        #[cfg(cosmo)]
+        spawn_producer(sh.clone());
+        #[cfg(all(cosmo, target_arch = "aarch64"))]
+        spawn_adopter();
         let mut app_side = App { sh: sh.clone(), core: core.clone(), side: 0, generation: 0, cur: 0, surfaces: [None, None] };
         app_side.ensure_size();
         // Bind buffer 0 so the window shows something before the first flip; draw the first frame into 1.
@@ -483,14 +485,45 @@ pub fn open(core: Arc<Core>, title: &str, width: u32, height: u32) -> Option<(Ap
         send0(win, sel("center"));
         send_bool(app, sel("activateIgnoringOtherApps:"), true);
         send0(app, sel("finishLaunching"));
+        trace("app launched");
 
         // The display link: exactly one callback per physical refresh, on its own thread.
         let mut link: *mut core::ffi::c_void = core::ptr::null_mut();
-        if CVDisplayLinkCreateWithCGDisplay(CGMainDisplayID(), &mut link) != 0 || link.is_null() { eprintln!("softer_gui: CVDisplayLink creation failed"); return None; }
+        trace("creating display link");
+        if CVDisplayLinkCreateWithCGDisplay(CGMainDisplayID(), &mut link) != 0 || link.is_null() {
+            eprintln!("softer_gui: CVDisplayLink creation failed");
+            // The producer is already running by now (it has to be started
+            // before AppKit is activated); `quit` is what stops it.
+            core.quit.store(true, Relaxed);
+            return None;
+        }
+        trace("link created");
         sh.link.store(link as u64, Relaxed);
-        CVDisplayLinkSetOutputCallback(link, link_callback, Arc::as_ptr(&sh) as *mut _);
-        std::mem::forget(sh.clone());   // the callback's reference lives as long as the process
+        // Seed the period from the mode now: the callback sets it too, but open()
+        // returns before the first tick and period_fs() would read the 60 Hz default.
+        {
+            let t = CVDisplayLinkGetNominalOutputVideoRefreshPeriod(link);
+            if t.scale != 0 && t.flags & 1 == 0 { core.set_period_fs((t.value as u128 * 1_000_000_000_000_000u128 / t.scale as u128) as u64); }
+        }
+        #[cfg(not(cosmo))]
+        {
+            CVDisplayLinkSetOutputCallback(link, link_callback, Arc::as_ptr(&sh) as *mut _);
+            std::mem::forget(sh.clone());   // the callback's reference lives as long as the process
+        }
+        // In an APE the callback only counts vblanks; a cosmo thread produces.
+        #[cfg(cosmo)]
+        {
+            let _ = link_callback;
+            trace("period seeded; setting callback");
+            CVDisplayLinkSetOutputCallback(link, link_tick, core::ptr::null_mut());
+        }
+        trace("callback set; starting link");
         CVDisplayLinkStart(link);
+        // Started first, on purpose: CVDisplayLinkStart spins up CoreVideo's own
+        // IO thread, and doing that while a cosmo-created thread is already
+        // running deadlocks the process on macOS.
+
+        trace("display link started");
 
         let pump = Pump {
             sh, app, win, layer, layout: Layout::new(),
@@ -504,6 +537,7 @@ pub fn open(core: Arc<Core>, title: &str, width: u32, height: u32) -> Option<(Ap
             cls_nscursor: cls("NSCursor"), sel_hide: sel("hide"), sel_unhide: sel("unhide"), sel_toggle_fs: sel("toggleFullScreen:"),
             cursor_applied: false, fs_applied: false, focused: true, close_sent: false, display: 0, nsmods: 0,
         };
+        trace("pump built");
         Some((app_side, pump))
     }
 }
@@ -520,6 +554,12 @@ pub fn open(core: Arc<Core>, title: &str, width: u32, height: u32) -> Option<(Ap
 // The handoff is one naked function so that NOT ONE Rust instruction runs on the shared
 // stack between capturing the context and leaving it: capture, publish the flag, switch
 // sp, branch to the pump. The adopting thread returns from `handoff` with 1.
+// x28 is deliberately absent from the cosmo variant: cosmopolitan keeps its
+// per-thread state there (rustc is told to reserve it, and check-regs.py
+// asserts it), so carrying the calling thread's value across to the adopting
+// thread would give two threads one thread-state pointer. That is a hang, not a
+// crash: the app thread disappears and AppKit is never pumped. Native builds
+// save and restore it as the AAPCS callee-saved register it is.
 #[cfg(target_arch = "aarch64")]
 #[unsafe(naked)]
 unsafe extern "C" fn handoff(ctx: *mut u64, flag: *const u32, new_sp: u64, pump: extern "C" fn(*mut core::ffi::c_void) -> !, arg: *mut core::ffi::c_void) -> u64 {
@@ -528,7 +568,10 @@ unsafe extern "C" fn handoff(ctx: *mut u64, flag: *const u32, new_sp: u64, pump:
         "stp x21, x22, [x0, #16]",
         "stp x23, x24, [x0, #32]",
         "stp x25, x26, [x0, #48]",
+        #[cfg(not(cosmo))]
         "stp x27, x28, [x0, #64]",
+        #[cfg(cosmo)]
+        "str x27, [x0, #64]",
         "stp x29, x30, [x0, #80]",
         "mov x9, sp",
         "str x9, [x0, #96]",
@@ -551,7 +594,10 @@ unsafe extern "C" fn resume(ctx: *const u64) -> ! {
         "ldp x21, x22, [x0, #16]",
         "ldp x23, x24, [x0, #32]",
         "ldp x25, x26, [x0, #48]",
+        #[cfg(not(cosmo))]
         "ldp x27, x28, [x0, #64]",
+        #[cfg(cosmo)]
+        "ldr x27, [x0, #64]",
         "ldp x29, x30, [x0, #80]",
         "ldr x9, [x0, #96]",
         "mov sp, x9",
@@ -564,8 +610,35 @@ unsafe extern "C" fn resume(ctx: *const u64) -> ! {
     )
 }
 
-#[link(name = "System")]
-unsafe extern "C" { fn pthread_main_np() -> i32; }
+// ---- the adopting thread, created early (cosmo) -------------------------------------
+// Creating a thread once CoreVideo and AppKit are running crashes the creator in
+// an APE: `thread::spawn` returns, `pthread_detach` runs, and the caller comes
+// back with a frame pointer of 0x7fffffffffff -- a signal-frame sentinel -- so
+// its next stack store faults. Both threads this backend needs are therefore
+// started before that point and parked on an atomic until there is work.
+#[cfg(cosmo)]
+static ADOPT_CTX: AtomicU64 = AtomicU64::new(0);
+#[cfg(cosmo)]
+static ADOPT_FLAG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+// aarch64 only, like the handoff itself: an APE's x86-64 half never opens a
+// window (Apple Silicon is the supported Mac here), so there is nothing to adopt.
+#[cfg(all(cosmo, target_arch = "aarch64"))]
+fn spawn_adopter() {
+    std::thread::Builder::new().name("softer_gui-app".into()).stack_size(64 << 10).spawn(|| {
+        // Two waits: the context has to exist, then handoff has to say the
+        // stack is free. Sleeping (not spinning) for the first one keeps an
+        // idle core out of it; the second is over in nanoseconds.
+        loop {
+            let ctx = ADOPT_CTX.load(Acquire);
+            if ctx != 0 {
+                while ADOPT_FLAG.load(Acquire) == 0 { std::thread::yield_now(); }
+                unsafe { resume(ctx as *const u64) }
+            }
+            std::thread::sleep(std::time::Duration::from_micros(300));
+        }
+    }).expect("app thread");
+}
 
 extern "C" fn pump_forever(arg: *mut core::ffi::c_void) -> ! {
     let pump: &mut Pump = unsafe { &mut *(arg as *mut Pump) };
@@ -587,12 +660,23 @@ pub fn takeover_main_thread(pump: Pump) -> bool {
     let stack: &'static mut Vec<u8> = Box::leak(Box::new(vec![0u8; 4 << 20]));
     let top = (stack.as_mut_ptr() as u64 + stack.len() as u64) & !15;
     let ctx_addr = ctx as *mut [u64; 24] as usize;
-    let flag_ref: &'static std::sync::atomic::AtomicU32 = flag;
-    std::thread::Builder::new().name("softer_gui-app".into()).stack_size(64 << 10).spawn(move || {
-        while flag_ref.load(Acquire) == 0 { std::thread::yield_now(); }
-        unsafe { resume(ctx_addr as *const u64) }
-    }).expect("thread");
-    let r = unsafe { handoff(ctx.as_mut_ptr(), flag.as_ptr(), top, pump_forever, pump_ptr) };
+    #[cfg(not(cosmo))]
+    let r = {
+        let flag_ref: &'static std::sync::atomic::AtomicU32 = flag;
+        std::thread::Builder::new().name("softer_gui-app".into()).stack_size(64 << 10).spawn(move || {
+            while flag_ref.load(Acquire) == 0 { std::thread::yield_now(); }
+            unsafe { resume(ctx_addr as *const u64) }
+        }).expect("thread");
+        unsafe { handoff(ctx.as_mut_ptr(), flag.as_ptr(), top, pump_forever, pump_ptr) }
+    };
+    // The thread already exists (spawn_adopter, called from open); hand it the
+    // context and let handoff publish the flag it is watching.
+    #[cfg(cosmo)]
+    let r = {
+        let _ = flag;
+        ADOPT_CTX.store(ctx_addr as u64, Release);
+        unsafe { handoff(ctx.as_mut_ptr(), ADOPT_FLAG.as_ptr(), top, pump_forever, pump_ptr) }
+    };
     r == 1
 }
 #[cfg(not(target_arch = "aarch64"))]
