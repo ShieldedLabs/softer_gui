@@ -40,8 +40,11 @@ pub struct Shared {
     sync_done: AtomicU64,
     /// (w<<32|h) of the ConfigureNotify that followed the pending sync request; 0 = not yet configured.
     sync_size: AtomicU64,
+    /// Present serial of the frame that answers the sync request; the pump acks when it COMPLETES.
+    sync_ack_serial: AtomicU32,
     pixmap: [AtomicU32; 2],
     present_serial: AtomicU32,
+    debug: bool,
 }
 
 struct Buf { mem: ShmMem, seg: u32, pixmap: u32 }
@@ -157,20 +160,19 @@ impl App {
         self.core.in_flight.fetch_add(1, AcqRel);
         self.cur ^= 1;
         // _NET_WM_SYNC_REQUEST: the WM sent a request, then the ConfigureNotify; it now
-        // waits for the counter before its next resize step. Release it only when the
-        // frame just queued was laid out for THAT configured size — a frame that was
-        // already in progress at the old size must not count, or the WM runs ahead of
-        // what is on screen and the drag shows stale, clipped frames.
+        // waits for the counter before its next resize step. The frame that answers it is
+        // one laid out for THAT configured size — a frame already in progress at the old
+        // size does not count. And it answers only once it is ON SCREEN: the pump sets the
+        // counter on this present's CompleteNotify, not here. Acking as soon as the present
+        // is queued lets the WM resize the window again before the server has copied this
+        // frame into it, and the drag shows stale, clipped frames.
         let want = sh.sync_want.load(Acquire);
         let cfg = sh.sync_size.load(Acquire);
         if sh.sync_counter != 0 && want != sh.sync_done.load(Relaxed) && cfg != 0
             && cfg == ((self.frame_w as u64) << 32 | self.frame_h as u64) {
-            let mut b = Vec::new();
-            b.extend_from_slice(&u32b(sh.sync_counter));
-            b.extend_from_slice(&u32b((want >> 32) as u32)); b.extend_from_slice(&u32b(want as u32));
-            sh.conn.req(sh.ext.sync, 3, &b);
-            sh.sync_done.store(want, Relaxed);
+            sh.sync_ack_serial.store(serial, Release);
             sh.sync_size.store(0, Relaxed);
+            if sh.debug { eprintln!("[{}] sync: frame {}x{} queued as serial {}", (sys::clock_monotonic_ns() / 1_000_000) % 100_000, self.frame_w, self.frame_h, serial); }
         }
         sh.conn.flush();
     }
@@ -408,7 +410,10 @@ impl Pump {
                 if w != 0 && h != 0 && (w != self.core.win_w.load(Relaxed) || h != self.core.win_h.load(Relaxed)) {
                     self.core.win_w.store(w, Relaxed); self.core.win_h.store(h, Relaxed);
                     self.core.full_redraw.store(true, Relaxed);
-                    if self.core.in_flight.load(Acquire) == 0 { self.core.push_render(); }
+                    // A new size wants a frame NOW, not at the next completion: during a drag
+                    // every vblank of delay is a step the WM waits on. A second present in
+                    // flight is fine — the msc gate still ticks once per vblank.
+                    self.core.push_render();
                 }
                 // The configure that answers a pending sync request names the size the WM is waiting on.
                 if !synthetic && w != 0 && h != 0 && self.sh.sync_want.load(Acquire) != self.sh.sync_done.load(Acquire) {
@@ -444,7 +449,20 @@ impl Pump {
                     if w != 0 && h != 0 { self.core.win_w.store(w, Relaxed); self.core.win_h.store(h, Relaxed); self.core.full_redraw.store(true, Relaxed); }
                 }
                 1 => {   // CompleteNotify
-                    let mode = p[11]; let msc = rd64(p, 32);
+                    let mode = p[11]; let msc = rd64(p, 32); let serial = rd32(p, 20);
+                    // The frame the WM's sync request was waiting on is on screen: release it.
+                    let ack = self.sh.sync_ack_serial.load(Acquire);
+                    if ack != 0 && serial >= ack {
+                        self.sh.sync_ack_serial.store(0, Relaxed);
+                        let want = self.sh.sync_want.load(Acquire);
+                        let mut b = Vec::new();
+                        b.extend_from_slice(&u32b(self.sh.sync_counter));
+                        b.extend_from_slice(&u32b((want >> 32) as u32)); b.extend_from_slice(&u32b(want as u32));
+                        self.sh.conn.req(self.sh.ext.sync, 3, &b);
+                        self.sh.sync_done.store(want, Relaxed);
+                        self.sh.conn.flush();
+                        if self.debug { eprintln!("[{}] sync: acked {want} on complete of serial {serial}", (sys::clock_monotonic_ns() / 1_000_000) % 100_000); }
+                    }
                     let frames = if self.first_complete { 1 } else { msc.saturating_sub(self.last_msc) };
                     let first = self.first_complete;
                     self.first_complete = false;
@@ -713,8 +731,9 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
 
     let sh = Arc::new(Shared {
         conn, win, ext, sync_counter,
-        sync_want: AtomicU64::new(0), sync_done: AtomicU64::new(0), sync_size: AtomicU64::new(0),
+        sync_want: AtomicU64::new(0), sync_done: AtomicU64::new(0), sync_size: AtomicU64::new(0), sync_ack_serial: AtomicU32::new(0),
         pixmap: [AtomicU32::new(0), AtomicU32::new(0)], present_serial: AtomicU32::new(1),
+        debug: std::env::var("SOFTER_GUI_DEBUG").is_ok(),
     });
     let mut pump = Pump {
         sh: sh.clone(), core: core.clone(), r, atoms, keymap: xkb::Keymap::default(),

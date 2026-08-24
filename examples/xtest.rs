@@ -14,7 +14,7 @@ fn fake(conn: &Conn, xt: u8, ty: u8, detail: u8, x: i16, y: i16) {
     b.extend_from_slice(&x.to_le_bytes()); b.extend_from_slice(&y.to_le_bytes()); b.extend_from_slice(&[0u8; 8]);
     conn.req(xt, 2, &b);
     conn.flush();
-    std::thread::sleep(std::time::Duration::from_millis(30));
+    std::thread::sleep(std::time::Duration::from_millis(8));
 }
 #[cfg(target_os = "linux")]
 fn main() {
@@ -73,6 +73,21 @@ fn main() {
                 conn.req(25, 0, &b); conn.flush();
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 i += 2;
+            }
+            "raise" => {
+                let id = u32::from_str_radix(args[i + 1].trim_start_matches("0x"), 16).unwrap();
+                let mut b = Vec::new(); b.extend_from_slice(&id.to_le_bytes()); b.extend_from_slice(&(1u16 << 6).to_le_bytes()); b.extend_from_slice(&[0, 0]);
+                b.extend_from_slice(&0u32.to_le_bytes());   // stack_mode Above
+                conn.req(12, 0, &b); conn.flush();
+                i += 2;
+            }
+            "drag" => {   // drag X0 Y0 X1 Y1 STEPS MS: press at X0,Y0, move in STEPS to X1,Y1 every MS, release
+                let v: Vec<i32> = args[i + 1..i + 7].iter().map(|a| a.parse().unwrap()).collect();
+                let (x0, y0, x1, y1, steps, ms) = (v[0], v[1], v[2], v[3], v[4], v[5] as u64);
+                fake(&conn, xt, 6, 0, x0 as i16, y0 as i16); fake(&conn, xt, 4, 1, 0, 0);
+                for k in 1..=steps { fake(&conn, xt, 6, 0, (x0 + (x1 - x0) * k / steps) as i16, (y0 + (y1 - y0) * k / steps) as i16); std::thread::sleep(std::time::Duration::from_millis(ms)); }
+                fake(&conn, xt, 5, 1, 0, 0);
+                i += 7;
             }
             "focus" => {
                 let id = u32::from_str_radix(args[i + 1].trim_start_matches("0x"), 16).unwrap();
