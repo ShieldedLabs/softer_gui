@@ -80,8 +80,10 @@ app, and keeps the real main thread pumping AppKit on a private stack; the
 CVDisplayLink thread is the producer. Windows: a pump thread creates the HWND and
 owns the message loop (Win32 message queues are per-thread), a vblank thread does
 nothing but wait for the next refresh and signal an event the pump waits on
-alongside messages, and the app thread only writes pixels and blits. Same polling
-API on every platform.
+alongside messages, and the app thread only writes pixels. Every Win32 and GDI
+call, the blit included, happens on the pump thread, because a window belongs to
+its creating thread and that thread can be parked inside DefWindowProc for the
+whole of a modal resize drag. Same polling API on every platform.
 
 ## Status
 

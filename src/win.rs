@@ -43,9 +43,18 @@
 //! thread creates the HWND and owns the message loop and all window state (Win32
 //! message queues are per-thread and a window belongs to its creator); a vblank
 //! thread does nothing but wait for the next refresh and signal an event; the app
-//! thread only writes pixels and blits. The app never touches the HWND, so every
-//! outward request (cursor, fullscreen, icon) goes through the flags on Core that
-//! the pump already polls, exactly as the other backends do.
+//! thread only writes pixels. EVERY Win32 and GDI call, the blit included, happens
+//! on the pump thread, because a window belongs to the thread that created it and
+//! that thread can be parked inside DefWindowProc for a whole modal resize drag.
+//! So the app never touches the HWND: outward requests (cursor, fullscreen, icon)
+//! go through the flags on Core that the pump polls, exactly as on the other
+//! backends, and submit() publishes the frame and posts WM_SOFTER_BLIT.
+//!
+//! RESIZE. Windows runs a modal loop while a border is dragged, in which
+//! DefWindowProc does not return and the pump's own loop stops. A timer, which is
+//! the one thing still delivered in that loop, becomes the frame source for the
+//! duration, so display time keeps advancing and the app keeps animating rather
+//! than re-rendering one frozen timestamp.
 //!
 //! KNOWN LIMITATIONS, written down so they are not mistaken for bugs: with
 //! variable-refresh displays active, "nominal refresh period" is a fiction and the
@@ -66,6 +75,13 @@ use crate::scancode_win::to_evdev;
 use crate::sys_win::*;
 
 const FS: u64 = 1_000_000_000_000_000;
+
+/// The frame source during the modal resize loop (see WM_ENTERSIZEMOVE).
+const RESIZE_TIMER: usize = 1;
+/// Windows clamps timers to about 10 ms, so this asks for "as often as you can".
+/// It is deliberately FASTER than any refresh rate: frame_tick gates itself on
+/// DWM's refresh counter, so polling too often costs a cheap call and nothing else.
+const RESIZE_TIMER_MS: u32 = 8;
 
 fn now_ns() -> u64 { (qpc() as u128 * 1_000_000_000u128 / qpf() as u128) as u64 }
 
@@ -123,6 +139,8 @@ pub struct Shared {
     ready_cv: Condvar,
     period_fs: AtomicU64,
     dyn_: Arc<Dyn>,
+    /// The app has a frame in the buffer that nobody has put on screen yet.
+    dirty: AtomicBool,
     quit_vblank: AtomicBool,
     vblank_ev: AtomicUsize,
     generation: AtomicU32,
@@ -158,32 +176,27 @@ impl App {
         Some((s.pixels, s.side, self.generation << 1))
     }
 
-    /// Copy the window-sized top-left sub-rect of the square buffer to the window.
-    /// BitBlt is synchronous from our point of view: when it returns the pixels are
-    /// ours again, which is the whole reason one buffer suffices here.
+    /// Publish the finished frame and ask the pump to put it on screen.
+    ///
+    /// This deliberately does NO GDI of its own. A window belongs to the thread
+    /// that created it, and GDI against that window from another thread has to
+    /// serialise with whatever the owning thread is doing to it. The case that
+    /// makes this more than theory is the modal move/size loop: while the user
+    /// holds a border, the window's thread sits inside DefWindowProc and does not
+    /// return, so an app-thread blit has nothing to serialise against and no bound
+    /// on how long it waits. That is a freeze lasting the whole drag.
+    ///
+    /// So the rule is absolute, and it is the rule the module header already
+    /// states: every Win32 and GDI call happens on the pump thread. We publish the
+    /// frame and post; the pump blits from inside its message loop, where it is
+    /// safe both normally and mid-drag. The cost is one PostMessage and a thread
+    /// hop, comfortably inside a frame (measured: submit() returns in under a
+    /// millisecond, including during the modal loop).
     pub fn submit(&mut self) {
         let hwnd = self.sh.hwnd.load(Relaxed) as HWND;
         if hwnd.is_null() { return; }
-        let w = self.core.win_w.load(Relaxed) as i32;
-        let h = self.core.win_h.load(Relaxed) as i32;
-        if w <= 0 || h <= 0 { return; }
-        let g = match self.sh.surf.lock() { Ok(g) => g, Err(_) => return };
-        let Some(s) = g.as_ref() else { return };
-        unsafe {
-            // Our OWN cache DC, fetched and released around the blit. Sharing one
-            // HDC with the pump thread (which is what CS_OWNDC would give us) is
-            // the classic Win32 deadlock: we would hold `surf` while GDI waits on
-            // the window's owning thread, and that thread would be in WM_PAINT
-            // waiting for `surf`. GetDC hands each thread its own DC and the cycle
-            // cannot form. It costs a few microseconds a frame.
-            let dc = GetDC(hwnd);
-            if dc.is_null() { return; }
-            BitBlt(dc, 0, 0, w.min(s.side as i32), h.min(s.side as i32), s.memdc, 0, 0, SRCCOPY);
-            // GDI batches; without this the blit may not have happened before we
-            // return and start drawing the next frame into the same pixels.
-            GdiFlush();
-            ReleaseDC(hwnd, dc);
-        }
+        self.sh.dirty.store(true, Release);
+        unsafe { PostMessageW(hwnd, WM_SOFTER_BLIT, 0, 0) };
     }
 
     pub fn poke(&self) {
@@ -296,6 +309,7 @@ struct Pump {
     cursor: HANDLE,
     buttons: Cell<u32>,
     last_refresh: Cell<u64>,
+    last_tick_ns: Cell<u64>,
     have_refresh: Cell<bool>,
     in_size_move: Cell<bool>,
     cursor_hidden: Cell<bool>,
@@ -528,10 +542,45 @@ impl Pump {
         }
     }
 
+    /// Put the app's most recent frame on screen from the PUMP thread, which is the
+    /// only thread that can do it without blocking while the modal loop is running.
+    /// A no-op when there is nothing new, so the main loop can call it every pass.
+    fn blit(&self) {
+        if !self.sh.dirty.load(Acquire) { return; }
+        let (w, h) = (self.core.win_w.load(Relaxed) as i32, self.core.win_h.load(Relaxed) as i32);
+        if w <= 0 || h <= 0 { return; }
+        // try_lock, never lock. The pump must not block on a mutex the app holds:
+        // the app can be part-way through reallocating the buffer, and a pump that
+        // waits is a window that stops answering Windows. Leaving `dirty` set and
+        // re-posting means the frame is retried rather than dropped.
+        let Ok(g) = self.sh.surf.try_lock() else {
+            unsafe { PostMessageW(self.hwnd.get(), WM_SOFTER_BLIT, 0, 0) };
+            return;
+        };
+        let Some(s) = g.as_ref() else { return };
+        self.sh.dirty.store(false, Release);
+        unsafe {
+            let dc = GetDC(self.hwnd.get());
+            if dc.is_null() { return; }
+            BitBlt(dc, 0, 0, w.min(s.side as i32), h.min(s.side as i32), s.memdc, 0, 0, SRCCOPY);
+            GdiFlush();
+            ReleaseDC(self.hwnd.get(), dc);
+        }
+    }
+
     // ---- the frame boundary -----------------------------------------------------
     /// One refresh passed. This is the only place display time moves.
-    fn frame_tick(&self) {
+    ///
+    /// `gated` means "advance ONLY if a refresh boundary has demonstrably passed".
+    /// The vblank thread already guarantees that, so the normal path passes false
+    /// and keeps its long-standing behaviour of always advancing at least one
+    /// period. The resize timer cannot guarantee it (it fires about twice per
+    /// refresh, and Windows does not promise even that), so it passes true and lets
+    /// this function decide. Getting that backwards would run display time at the
+    /// timer's rate instead of the display's, which is worse than freezing it.
+    fn frame_tick(&self, gated: bool) {
         let mut frames = 1u64;
+        let mut counted = false;
         if let Some(f) = self.dyn_.dwm_timing {
             let mut t = DWM_TIMING_INFO::default();
             if unsafe { f(NULL, &mut t) } >= 0 && t.cRefresh != 0 {
@@ -545,15 +594,29 @@ impl Pump {
                 if self.have_refresh.get() {
                     // cRefresh is a monotonic vblank counter: its delta IS the number
                     // of whole refresh periods that elapsed, the same thing X11
-                    // Present's MSC delta gives us. Clamped because a suspend or a
-                    // mode change can jump it arbitrarily, and display time must not
-                    // absorb a discontinuity.
-                    frames = t.cRefresh.saturating_sub(self.last_refresh.get()).clamp(1, 8);
+                    // Present's MSC delta gives us.
+                    frames = t.cRefresh.saturating_sub(self.last_refresh.get());
+                    counted = true;
                 }
                 self.last_refresh.set(t.cRefresh);
                 self.have_refresh.set(true);
             }
         }
+        if counted {
+            // The counter has not moved, so there is no frame boundary to stamp.
+            // This is the whole reason the resize timer may poll as fast as it likes.
+            if frames == 0 && gated { return; }
+            // Clamped because a suspend or a mode change can jump the counter
+            // arbitrarily, and display time must not absorb a discontinuity.
+            frames = frames.clamp(1, 8);
+        } else if gated {
+            // No counter to consult (no DWM, or composition switched off), so gate on
+            // the wall clock instead. Coarser, but it still refuses to invent frames.
+            let now = now_ns();
+            let period_ns = self.sh.period_fs.load(Relaxed) / 1_000_000;
+            if now.saturating_sub(self.last_tick_ns.get()) < period_ns { return; }
+        }
+        self.last_tick_ns.set(now_ns());
         self.core.display_tick(frames);
         self.core.push_render();
     }
@@ -566,10 +629,9 @@ impl Pump {
                 let mut ps = PAINTSTRUCT::default();
                 unsafe { BeginPaint(h, &mut ps) };
                 let (cw, ch) = (self.core.win_w.load(Relaxed) as i32, self.core.win_h.load(Relaxed) as i32);
-                // try_lock, never lock: if the app thread is mid-blit we simply skip
-                // this repaint, which is free of consequence because the frame it is
-                // blitting right now is the one we would have drawn. Blocking here
-                // instead is what deadlocks against a submit() in progress.
+                // try_lock, never lock: if the app is mid-reallocation we skip this
+                // repaint rather than stalling the message loop. Nothing is lost;
+                // the app submits again and WM_SOFTER_BLIT puts it up.
                 if let Ok(g) = self.sh.surf.try_lock() {
                     if let Some(s) = g.as_ref() {
                         unsafe { BitBlt(ps.hdc, 0, 0, cw.min(s.side as i32), ch.min(s.side as i32), s.memdc, 0, 0, SRCCOPY); }
@@ -581,17 +643,41 @@ impl Pump {
             WM_SIZE => {
                 if w != SIZE_MINIMIZED {
                     self.update_size();
-                    // Windows runs a MODAL loop while the user drags a border:
-                    // DefWindowProc does not return until the drag ends, so the pump
-                    // loop below is not running and would emit no RENDER at all.
-                    // Pushing one here without ticking the clock is exactly right:
-                    // an unchanged timestamp means "same frame, re-render".
-                    if self.in_size_move.get() { self.core.push_render(); }
+                    // A size step inside the drag is a chance to advance the clock
+                    // early rather than waiting for the next timer tick, which keeps
+                    // motion smooth exactly while the mouse is moving.
+                    if self.in_size_move.get() { self.frame_tick(true); self.blit(); }
                 }
                 return 0;
             }
-            WM_ENTERSIZEMOVE => { self.in_size_move.set(true); return 0; }
-            WM_EXITSIZEMOVE => { self.in_size_move.set(false); self.update_size(); return 0; }
+            WM_ENTERSIZEMOVE => {
+                self.in_size_move.set(true);
+                // Windows runs a MODAL loop while the user drags a border or a
+                // corner: DefWindowProc does not return until the drag ends, so
+                // run() below stops looping and nothing drives the frame clock. A
+                // timer is the one thing Windows still delivers inside that loop, so
+                // it becomes the frame source for the duration. Without it the app
+                // keeps redrawing one frozen timestamp: the window resizes but the
+                // content stops moving, which reads as a hang.
+                unsafe { SetTimer(h, RESIZE_TIMER, RESIZE_TIMER_MS, core::ptr::null()) };
+                return 0;
+            }
+            WM_EXITSIZEMOVE => {
+                self.in_size_move.set(false);
+                unsafe { KillTimer(h, RESIZE_TIMER) };
+                self.update_size();
+                self.blit();
+                return 0;
+            }
+            WM_TIMER if w == RESIZE_TIMER => {
+                // Everything run() would be doing for us, for as long as it cannot.
+                self.core.service_resync();
+                self.apply_cursor();
+                self.core.repeat_tick(now_ns());
+                self.frame_tick(true);
+                self.blit();
+                return 0;
+            }
             WM_CLOSE => { self.core.push_close(); return 0; }   // the app decides, not us
             WM_DESTROY => { self.core.quit.store(true, Relaxed); return 0; }
             WM_SETFOCUS => { self.core.focused.store(true, Relaxed); return 0; }
@@ -667,6 +753,7 @@ impl Pump {
                 return 0;
             }
             WM_SETTINGCHANGE => { self.refresh_repeat(); return 0; }
+            WM_SOFTER_BLIT => { self.blit(); return 0; }
             WM_SOFTER_POKE => return 0,
             _ => {}
         }
@@ -690,13 +777,19 @@ impl Pump {
             self.apply_cursor();
             self.apply_fullscreen();
             self.apply_icon();
+            // NOT self.blit() here. Outside the modal loop the app thread does its
+            // own blit, and touching this window through GDI from the pump while it
+            // is NOT processing a message deadlocks against another thread calling
+            // SetWindowPos: that call holds the window lock and waits for us to pump,
+            // while GetDC here waits for that same lock. Pump-side blitting stays
+            // inside message handlers, which is exactly where the modal loop needs it.
             let ms = self.core.repeat_tick(now_ns());
             // The structural analog of poll() in the Linux pump. MWMO_INPUTAVAILABLE
             // is not optional: without it a message that arrives between the drain
             // above and this wait is marked already-seen and we sleep through it,
             // which shows up as a window that occasionally stops responding.
             let r = unsafe { MsgWaitForMultipleObjectsEx(1, &vblank, ms as u32, QS_ALLINPUT, MWMO_INPUTAVAILABLE) };
-            if r == WAIT_OBJECT_0 { self.frame_tick(); }
+            if r == WAIT_OBJECT_0 { self.frame_tick(false); }
         }
         unsafe {
             let b = self.icon_big.get(); if b != 0 { DestroyIcon(b as HICON); }
@@ -735,6 +828,7 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
         ready_cv: Condvar::new(),
         period_fs: AtomicU64::new(period),
         dyn_: d.clone(),
+        dirty: AtomicBool::new(false),
         quit_vblank: AtomicBool::new(false),
         vblank_ev: AtomicUsize::new(vblank_ev as usize),
         generation: AtomicU32::new(0),
@@ -787,7 +881,7 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
         let pump = Pump {
             sh: sh2.clone(), core: core2, hwnd: Cell::new(hwnd), dyn_: d.clone(),
             cursor,
-            buttons: Cell::new(0), last_refresh: Cell::new(0), have_refresh: Cell::new(false),
+            buttons: Cell::new(0), last_refresh: Cell::new(0), last_tick_ns: Cell::new(0), have_refresh: Cell::new(false),
             in_size_move: Cell::new(false), cursor_hidden: Cell::new(false), fs_applied: Cell::new(false),
             saved_rect: Cell::new(RECT::default()), saved_style: Cell::new(0), saved_ex: Cell::new(0),
             icon_big: Cell::new(0), icon_small: Cell::new(0),

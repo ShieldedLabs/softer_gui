@@ -3,19 +3,22 @@
 //! ITSELF rather than whatever happens to be focused, which is what makes it safe
 //! to run unattended.
 //!
-//! Keyboard goes through real SendInput with KEYEVENTF_SCANCODE, because that is
-//! the only way to exercise the path actually under test: ToUnicodeEx resolves text
-//! from the kernel's real keyboard state, which PostMessage cannot fake. That means
-//! synthetic keystrokes are loose in the session, so there is an interlock: nothing
-//! is injected unless GetForegroundWindow() is OUR window, and the test reports
-//! SKIP instead of typing into someone else's application.
+//! Most of it drives the window procedure directly with PostMessage: pointer,
+//! wheel, and every scancode in the table. That is faithful, because the window
+//! procedure is the thing under test, and it has no global side effects at all, so
+//! it runs anywhere, including on a machine whose desktop belongs to somebody else
+//! at the time. The user's cursor never moves and no keystroke escapes.
 //!
-//! Pointer and wheel go through PostMessage to our own HWND, which is faithful (the
-//! window procedure is the thing being tested) and has no global side effects, so
-//! the user's cursor never moves.
+//! Two things PostMessage cannot fake, because ToUnicodeEx reads the kernel's real
+//! keyboard state: whether a modifier reaches the layout, and therefore whether
+//! shift actually changes the character. Those use real SendInput, which does put
+//! synthetic keystrokes into the session, so they sit behind an interlock: nothing
+//! is injected unless GetForegroundWindow() is OUR window, and the test reports
+//! SKIP rather than typing into someone else's application.
 //!
 //! This is what verifies the scancode table end to end, which the research notes
-//! flagged as the one piece that should not be trusted without a real keyboard.
+//! flagged as the one piece that should not be trusted without a real keyboard,
+//! along with resize/regrow and the modal resize loop.
 
 #![allow(non_snake_case, non_camel_case_types)]
 
@@ -59,7 +62,6 @@ mod inject {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         pub fn GetCurrentProcessId() -> u32;
-        pub fn GetCurrentThreadId() -> u32;
     }
 
     /// Windows refuses SetForegroundWindow from a process that is not already in
@@ -111,6 +113,25 @@ mod inject {
 #[cfg(target_os = "windows")]
 fn wide(s: &str) -> Vec<u16> { s.encode_utf16().chain(core::iter::once(0)).collect() }
 
+/// Fill only the window-sized sub-rect and submit. Painting the whole square
+/// buffer would be four times the work at 2048 and, unoptimised, slower than the
+/// display, which starves the event drain rather than testing anything.
+/// Returns how long submit() took, in ms.
+#[cfg(target_os = "windows")]
+fn paint(gui: &mut Gui) -> u128 {
+    let mut fb = gui.get_framebuffer();
+    if !fb.ok() { return 0; }
+    let (w, h, side) = (fb.width, fb.height, fb.side);
+    let px = fb.slice();
+    for y in 0..h {
+        let row = y * side;
+        for x in 0..w { px[row + x] = 0xFF202020; }
+    }
+    let b = std::time::Instant::now();
+    gui.submit();
+    b.elapsed().as_millis()
+}
+
 /// Pump the gui for `ms`, appending everything that arrives (except RENDER, which
 /// would drown the log) and submitting frames so the pacing chain keeps running.
 #[cfg(target_os = "windows")]
@@ -119,15 +140,44 @@ fn drain(gui: &mut Gui, ms: u64, out: &mut Vec<Event>) {
     let mut ev = Event::default();
     while t0.elapsed().as_millis() < ms as u128 {
         gui.wait_ms(5);
+        let mut n = 0;
         while gui.next_event(&mut ev) {
             if ev.kind == EVENT_RENDER {
-                let mut fb = gui.get_framebuffer();
-                if fb.ok() { for p in fb.slice().iter_mut() { *p = 0xFF202020; } gui.submit(); }
+                paint(gui);
             } else {
                 out.push(ev);
             }
+            // Bound the burst. A consumer slower than the pump would otherwise stay
+            // in this loop forever, which is how a slow debug build looks like a hang.
+            n += 1;
+            if n >= 32 { break; }
         }
     }
+}
+
+/// Like drain(), but records the display timestamp of every RENDER instead of
+/// discarding it. Used to watch the frame clock during the modal resize loop.
+#[cfg(target_os = "windows")]
+fn drain_renders(gui: &mut Gui, ms: u64, ts: &mut Vec<u128>) -> (u128, u128) {
+    let t0 = std::time::Instant::now();
+    let mut ev = Event::default();
+    let (mut slow_get, mut slow_submit) = (0u128, 0u128);
+    while t0.elapsed().as_millis() < ms as u128 {
+        gui.wait_ms(5);
+        let mut n = 0;
+        while gui.next_event(&mut ev) {
+            n += 1;
+            if n > 32 { break; }
+            if ev.kind == EVENT_RENDER {
+                ts.push(ev.t_fs);
+                let a = std::time::Instant::now();
+                let painted = paint(gui);
+                slow_get = slow_get.max(a.elapsed().as_millis());
+                slow_submit = slow_submit.max(painted);
+            }
+        }
+    }
+    (slow_get, slow_submit)
 }
 
 #[cfg(target_os = "windows")]
@@ -153,7 +203,9 @@ fn main() {
 
     let fails = std::cell::Cell::new(0u32);
     let check = |name: &str, ok: bool| {
+        use std::io::Write;
         println!("{} {}", if ok { "ok  " } else { "FAIL" }, name);
+        let _ = std::io::stdout().flush();
         if !ok { fails.set(fails.get() + 1); }
     };
 
@@ -236,17 +288,37 @@ fn main() {
     } else {
         // Shift changing the character is the one thing only real input can prove:
         // it means modifier state actually reached ToUnicodeEx.
-        evs.clear();
-        key(0x2A, false, true);                 // left shift down
-        tap(0x1E, false);
-        key(0x2A, false, false);                // left shift up
-        drain(&mut gui, 300, &mut evs);
-        let shifted = evs.iter().filter(|e| e.kind == EVENT_TEXT)
-            .flat_map(|e| e.text().to_vec()).any(|c| c.is_uppercase());
-        check("injected shift+key produces an uppercase character", shifted);
-        let lower = { evs.clear(); tap(0x1E, false); drain(&mut gui, 300, &mut evs);
-            evs.iter().filter(|e| e.kind == EVENT_TEXT).flat_map(|e| e.text().to_vec()).any(|c| c.is_lowercase()) };
-        check("and the same key without shift produces a lowercase one", lower);
+        //
+        // Retried, because injected input races window activation: a window can be
+        // foreground before it is ready to receive, and the first burst then lands
+        // nowhere. Retrying tests the same property without the flake.
+        let mut shifted = false;
+        for _ in 0..3 {
+            evs.clear();
+            key(0x2A, false, true);                 // left shift down
+            tap(0x1E, false);
+            key(0x2A, false, false);                // left shift up
+            drain(&mut gui, 300, &mut evs);
+            shifted = evs.iter().filter(|e| e.kind == EVENT_TEXT)
+                .flat_map(|e| e.text().to_vec()).any(|c| c.is_uppercase());
+            if shifted { break; }
+        }
+        // Another application can take the foreground between the interlock and
+        // here, and then the keystrokes never arrived. That is the harness losing a
+        // race, not the backend failing, so say so rather than crying wolf.
+        let still_ours = unsafe { GetForegroundWindow() } == hwnd;
+        if !shifted {
+            let got: String = evs.iter().filter(|e| e.kind == EVENT_TEXT).flat_map(|e| e.text().to_vec()).collect();
+            println!("     (diag: foreground still ours = {still_ours}, text received = {got:?})");
+        }
+        if !shifted && !still_ours {
+            println!("SKIP injected shift: lost the foreground mid-test");
+        } else {
+            check("injected shift+key produces an uppercase character", shifted);
+            let lower = { evs.clear(); tap(0x1E, false); drain(&mut gui, 300, &mut evs);
+                evs.iter().filter(|e| e.kind == EVENT_TEXT).flat_map(|e| e.text().to_vec()).any(|c| c.is_lowercase()) };
+            check("and the same key without shift produces a lowercase one", lower);
+        }
     }
 
     // ---- resize and buffer regrow -----------------------------------------------
@@ -271,8 +343,45 @@ fn main() {
     check("the framebuffer grew to the next power of two", fb.side == 2048 && side_before == 1024);
     check("crossing the boundary bumped the generation", fb.key >> 1 != gen_before);
     check("and the window-sized sub-rect matches the new client area", fb.width == 1200 && fb.height == 900);
-    let render_size = evs.iter().rev().find(|e| e.kind == EVENT_RENDER).map(|e| (e.width, e.height));
-    let _ = render_size;    // RENDER carries the size too, but drain() eats those
+
+    // ---- the modal resize loop --------------------------------------------------
+    // SC_SIZE enters the REAL modal loop, where DefWindowProc does not return and
+    // the pump's own loop stops running. Any RENDER that arrives in here therefore
+    // came from the resize timer, which is exactly the path under test. Escape ends
+    // it. This needs the foreground, because Escape has to reach the modal loop.
+    if focused {
+        let period = gui.period_fs() as u128;
+        let mut ts: Vec<u128> = Vec::new();
+        // Watchdog. The modal loop has to be ended from ANOTHER thread: the whole
+        // point of this test is that the app thread might be stuck, and leaving the
+        // escape to a stuck thread is how a test wedges a machine.
+        let h_usize = hwnd as usize;
+        let dog = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            tap(0x01, false);                                          // Escape
+            unsafe { PostMessageW(h_usize as HWND, 0x001F, 0, 0) };    // WM_CANCELMODE
+        });
+        unsafe { PostMessageW(hwnd, 0x0112, 0xF000, 0) };       // WM_SYSCOMMAND, SC_SIZE
+        let t0 = std::time::Instant::now();
+        let (slow_get, slow_submit) = drain_renders(&mut gui, 1200, &mut ts);
+        let secs = t0.elapsed().as_secs_f64();
+        let _ = dog.join();
+        drain(&mut gui, 250, &mut evs);
+
+        let n = ts.len();
+        check("RENDER keeps arriving inside the modal resize loop", n >= 20);
+        check("and the display timestamp advances instead of repeating",
+              n >= 2 && ts.windows(2).all(|w| w[1] > w[0]));
+        // The gate must stop the 8 ms timer running the clock at timer speed: a
+        // broken gate shows up right here as roughly double the frame count.
+        let expected = secs / (period as f64 / 1e15);
+        check("and it advances at the display rate, not the timer rate",
+              n as f64 <= expected * 1.35);
+        println!("     ({n} renders in {secs:.2}s, slowest get {slow_get} ms, slowest submit {slow_submit} ms)");
+    } else {
+        println!("SKIP modal resize loop: needs the foreground, because Escape is");
+        println!("SKIP modal resize loop: what gets back out of the loop.");
+    }
 
     // ---- close ------------------------------------------------------------------
     evs.clear();

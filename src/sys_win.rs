@@ -217,12 +217,15 @@ pub const WM_MOUSEWHEEL: u32 = 0x020A;
 pub const WM_XBUTTONDOWN: u32 = 0x020B;
 pub const WM_XBUTTONUP: u32 = 0x020C;
 pub const WM_MOUSEHWHEEL: u32 = 0x020E;
+pub const WM_TIMER: u32 = 0x0113;
 pub const WM_ENTERSIZEMOVE: u32 = 0x0231;
 pub const WM_EXITSIZEMOVE: u32 = 0x0232;
 pub const WM_DPICHANGED: u32 = 0x02E0;
 pub const WM_USER: u32 = 0x0400;
 /// Posted by the app thread to wake the pump out of its wait (poke()).
 pub const WM_SOFTER_POKE: u32 = WM_USER + 1;
+/// Posted by the app thread when it has a finished frame for the pump to put up.
+pub const WM_SOFTER_BLIT: u32 = WM_USER + 2;
 
 pub const SC_KEYMENU: usize = 0xF100;
 pub const SC_SCREENSAVE: usize = 0xF140;
@@ -324,6 +327,8 @@ unsafe extern "system" {
     pub fn ScreenToClient(h: HWND, p: *mut POINT) -> BOOL;
     pub fn GetCursorPos(p: *mut POINT) -> BOOL;
     pub fn PostQuitMessage(code: i32);
+    pub fn SetTimer(h: HWND, id: usize, ms: u32, proc_: *const c_void) -> usize;
+    pub fn KillTimer(h: HWND, id: usize) -> BOOL;
     #[cfg(target_pointer_width = "64")]
     pub fn GetWindowLongPtrW(h: HWND, index: i32) -> isize;
     #[cfg(target_pointer_width = "64")]
