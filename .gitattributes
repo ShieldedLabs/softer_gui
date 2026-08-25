@@ -1,0 +1,4 @@
+# Line endings are LF in the repository and in every checkout. Several files
+# were CRLF from Windows-side editing, which turns any tool that rewrites a
+# file in text mode into a whole-file diff.
+* text=auto eol=lf

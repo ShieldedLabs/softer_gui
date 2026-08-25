@@ -1,0 +1,50 @@
+# The demo application. Everything cosmopolitan lives here rather than in the
+# library: an APE is a program, the libc shim has to be referenced from the
+# crate that is *linked*, and a library has no business putting either in its
+# dependents' lockfiles.
+#
+#    cargo run                      the demo, natively
+#    cargo build -F ape --release    -> target/cosmo/demo.com
+#
+# Its own workspace: softer_gui is the package one directory up, and this is a
+# consumer of it like any other.
+[workspace]
+
+[package]
+name = "softer_gui_demo"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+
+[[bin]]
+name = "demo"
+path = "src/main.rs"
+
+[dependencies]
+softer_gui = { path = ".." }
+
+# What `cargo build -F ape` builds into the .com.
+[package.metadata.cosmo]
+bin = "demo"
+
+[features]
+ape = ["dep:cosmo-build"]
+
+[build-dependencies]
+cosmo-build = { version = "3", optional = true }
+
+# The libc shim, scoped to cfg(cosmo), which cosmo-build sets.
+[target.'cfg(cosmo)'.dependencies]
+cosmo-compat = "3"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(cosmo)'] }
+
+[profile.release]
+debug = 2
+codegen-units = 1
+lto = "fat"
+# unwind, not abort: cosmo-build builds std with panic_unwind only (cosmo ships
+# the full _Unwind_* ABI), and a mismatched panic runtime fails to link there.
+panic = "unwind"

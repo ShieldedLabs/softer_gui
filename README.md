@@ -117,24 +117,57 @@ whole of a modal resize drag. Same polling API on every platform.
 
 ## One universal binary (Cosmopolitan APE)
 
+The demo is an application crate in `demo/` -- `cd demo && cargo run` for the
+ordinary native build -- and that is where everything cosmopolitan lives.
 Nothing to check out and nothing to install:
 
 ```
+cd demo
 cargo build -F ape --release
 sh target/cosmo/demo.com          # x86-64 + arm64 in one file
 ```
 
-The `ape` feature pulls in [`cosmo-build`](https://crates.io/crates/cosmo-build),
-which runs the build once per architecture and fuses the two with `apelink`. It
-installs the nightly it needs (this repo's stable pin applies to native builds
-only) and downloads cosmopolitan's toolchain into a cache shared across
-projects, so the first APE build is slow and the rest are not. With the feature
-off none of that is fetched, compiled or run, and `cargo build` is the ordinary
-static musl build it always was.
+The library itself has no part in this. It takes no cosmo dependency, exposes
+no `ape` feature and has no build script, so a crate that depends on
+`softer_gui` sees none of it -- nothing in its lockfile, nothing to compile.
+The APE is a program and the libc shim has to be referenced from the crate that
+is *linked*, so both belong to the application, which is where any consumer of
+this library would put them too.
 
-This crate is a library, so the APE needs a program named for it:
-`[package.metadata.cosmo]` in `Cargo.toml` points at `examples/demo.rs`. Cargo
-ignores everything under `package.metadata`, so a native build never sees it.
+What the demo carries, and what your own application would:
+
+```toml
+[package.metadata.cosmo]
+bin = "demo"                      # what the .com is built from
+
+[features]
+ape = ["dep:cosmo-build"]
+
+[build-dependencies]
+cosmo-build = { version = "3", optional = true }
+
+[target.'cfg(cosmo)'.dependencies]
+cosmo-compat = "3"
+```
+
+```rust
+// build.rs
+fn main() {
+   #[cfg(feature = "ape")]
+   cosmo_build::apeify();
+}
+
+// src/main.rs
+#[cfg(cosmo)]
+extern crate cosmo_compat as _;
+```
+
+[`cosmo-build`](https://crates.io/crates/cosmo-build) runs the build once per
+architecture and fuses the two with `apelink`. It installs the nightly it needs
+(this repo's exact stable pin governs native builds as before) and downloads
+cosmopolitan's toolchain into a cache shared across projects, so the first APE
+build is slow and the rest are not. With the feature off none of that is
+fetched, compiled or run.
 
 Under `cfg(cosmo)`, which `cosmo-build` sets, `src/sys_cosmo.rs` replaces the
 raw syscalls with calls into cosmo's libc, so cosmo picks syscall numbers,
