@@ -73,6 +73,7 @@ use crate::event::*;
 use crate::keysym;
 use crate::scancode_win::to_evdev;
 use crate::sys_win::*;
+use crate::win_d3d::D3d;
 
 const FS: u64 = 1_000_000_000_000_000;
 
@@ -127,6 +128,18 @@ impl Drop for Surface {
     }
 }
 unsafe impl Send for Surface {}
+
+/// How pixels reach the screen, and how a frame boundary is learned. The two are
+/// chosen together because they are the same decision: the capable path's wait IS
+/// its swapchain, and the compatible path's wait is a thread watching the
+/// compositor. See the module header for what separates them.
+enum Present {
+    /// Vista and up. DIB section blitted to the window; vblank thread; DWM cRefresh.
+    Gdi,
+    /// Windows 8.1 and up. Flip-model swapchain; its waitable object; per-present
+    /// statistics. No vblank thread at all.
+    D3d(D3d),
+}
 
 // ---- shared between the three threads ------------------------------------------
 pub struct Shared {
@@ -307,6 +320,13 @@ struct Pump {
     hwnd: Cell<HWND>,
     dyn_: Arc<Dyn>,
     cursor: HANDLE,
+    /// RefCell, not Cell: the presenter is too big to copy and needs &mut. Nothing
+    /// re-enters it (no method here calls DefWindowProc), and every use try_borrows
+    /// anyway so a future one cannot deadlock the message loop.
+    present: core::cell::RefCell<Present>,
+    /// What run() sleeps on: the swapchain's waitable object on the capable path,
+    /// the vblank thread's event on the compatible one.
+    wait_handle: HANDLE,
     buttons: Cell<u32>,
     last_refresh: Cell<u64>,
     last_tick_ns: Cell<u64>,
@@ -559,12 +579,25 @@ impl Pump {
         };
         let Some(s) = g.as_ref() else { return };
         self.sh.dirty.store(false, Release);
-        unsafe {
-            let dc = GetDC(self.hwnd.get());
-            if dc.is_null() { return; }
-            BitBlt(dc, 0, 0, w.min(s.side as i32), h.min(s.side as i32), s.memdc, 0, 0, SRCCOPY);
-            GdiFlush();
-            ReleaseDC(self.hwnd.get(), dc);
+        let Ok(mut pres) = self.present.try_borrow_mut() else { return };
+        match &mut *pres {
+            Present::D3d(d) => {
+                // A failed present means the device went away (driver update, GPU
+                // reset, hibernate). Drop to the compatible path rather than dying:
+                // it needs no device and the window keeps working.
+                if !d.present(s.pixels as *const u32, s.side, w.min(s.side as i32) as u32, h.min(s.side as i32) as u32) {
+                    if self.debug { eprintln!("softer_gui: d3d present failed, falling back to GDI"); }
+                    *pres = Present::Gdi;
+                    self.core.full_redraw.store(true, Relaxed);
+                }
+            }
+            Present::Gdi => unsafe {
+                let dc = GetDC(self.hwnd.get());
+                if dc.is_null() { return; }
+                BitBlt(dc, 0, 0, w.min(s.side as i32), h.min(s.side as i32), s.memdc, 0, 0, SRCCOPY);
+                GdiFlush();
+                ReleaseDC(self.hwnd.get(), dc);
+            }
         }
     }
 
@@ -581,6 +614,31 @@ impl Pump {
     fn frame_tick(&self, gated: bool) {
         let mut frames = 1u64;
         let mut counted = false;
+        // The capable path contributes two things here and takes its refresh count
+        // from DWM below, which is not the arrangement that looks obvious.
+        //
+        // The obvious one is to pace off the swapchain's own PresentRefreshCount,
+        // since that is the true per-present MSC. Measured, it is not usable as a
+        // per-frame clock: DXGI updates those counters in bursts, sitting still for
+        // about sixty calls and then jumping sixty at once, so the drop accounting
+        // is always a beat behind. DWM's cRefresh is live every frame and gives
+        // exactly one period per frame (measured: 480 intervals of 1, no exceptions).
+        //
+        // So each source is used for what it is actually good at. The swapchain
+        // supplies the WAIT, which is the thing DWM cannot give, and the count of
+        // presents still in flight. DWM supplies the CLOCK. What the swapchain
+        // measures stays the fallback for a host with no DWM composition.
+        let mut d3d_frames: Option<u64> = None;
+        if let Ok(mut pres) = self.present.try_borrow_mut() {
+            if let Present::D3d(d) = &mut *pres {
+                d3d_frames = Some(d.frames_elapsed());
+                // Presents submitted but not yet shown: the same quantity the X11
+                // backend keeps from PresentCompleteNotify, and the reason
+                // Core::in_flight is meaningful on this path and inert on the other.
+                self.core.in_flight.store(d.in_flight, Relaxed);
+                if gated && d.occluded { return; }
+            }
+        }
         if let Some(f) = self.dyn_.dwm_timing {
             let mut t = DWM_TIMING_INFO::default();
             if unsafe { f(NULL, &mut t) } >= 0 && t.cRefresh != 0 {
@@ -609,9 +667,12 @@ impl Pump {
             // Clamped because a suspend or a mode change can jump the counter
             // arbitrarily, and display time must not absorb a discontinuity.
             frames = frames.clamp(1, 8);
+        } else if let Some(n) = d3d_frames {
+            // No DWM clock, but there is a swapchain: use what it measured.
+            frames = n.clamp(1, 8);
         } else if gated {
-            // No counter to consult (no DWM, or composition switched off), so gate on
-            // the wall clock instead. Coarser, but it still refuses to invent frames.
+            // Neither counter to consult, so gate on the wall clock instead.
+            // Coarser, but it still refuses to invent frames.
             let now = now_ns();
             let period_ns = self.sh.period_fs.load(Relaxed) / 1_000_000;
             if now.saturating_sub(self.last_tick_ns.get()) < period_ns { return; }
@@ -643,6 +704,11 @@ impl Pump {
             WM_SIZE => {
                 if w != SIZE_MINIMIZED {
                     self.update_size();
+                    if let Ok(mut pres) = self.present.try_borrow_mut() {
+                        if let Present::D3d(d) = &mut *pres {
+                            d.resize(self.core.win_w.load(Relaxed), self.core.win_h.load(Relaxed));
+                        }
+                    }
                     // A size step inside the drag is a chance to advance the clock
                     // early rather than waiting for the next timer tick, which keeps
                     // motion smooth exactly while the mouse is moving.
@@ -762,7 +828,7 @@ impl Pump {
 
     fn run(&self) {
         PUMP.with(|c| c.set(self as *const Pump));
-        let vblank = self.sh.vblank_ev.load(Relaxed) as HANDLE;
+        let vblank = self.wait_handle;
         loop {
             if self.core.quit.load(Relaxed) { break; }
             self.core.service_resync();
@@ -889,9 +955,43 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
         };
         sh2.hwnd.store(hwnd as usize, Relaxed);
 
+        // Which of the two Windows backends this run gets. The capable one is
+        // tried first and any failure at all falls through to the compatible one,
+        // because every reason it can fail (pre-8.1, no d3d11.dll, a driver that
+        // will not make a flip-model swapchain, a remote session) has the same
+        // answer. SOFTER_GUI_WIN=gdi forces the compatible path, which is how the
+        // Vista-era code stays testable on a machine that is not Vista.
+        let want = std::env::var("SOFTER_GUI_WIN").unwrap_or_default();
+        // A cosmo APE opts OUT of the capable path by default. D3D11 brings its own
+        // threads, thread-local storage and COM apartments into a process whose libc
+        // was swapped underneath it, and measured here it takes an int3 inside
+        // d3d11.dll before it ever returns a device. The compatible path needs none
+        // of that and is verified on the APE, so portability keeps the presenter
+        // that is actually portable. SOFTER_GUI_WIN=d3d still asks for it.
+        let try_d3d = if cfg!(cosmo) { want == "d3d" } else { want != "gdi" };
+        let present = if !try_d3d { Present::Gdi } else {
+            match D3d::new(hwnd, dbg) {
+                Some(d) => Present::D3d(d),
+                None => {
+                    if want == "d3d" { eprintln!("softer_gui: d3d requested but unavailable; using GDI"); }
+                    Present::Gdi
+                }
+            }
+        };
+        let use_d3d = matches!(present, Present::D3d(_));
+        // The capable path waits on the swapchain itself, so it needs no vblank
+        // thread; the compatible one does. This is the one structural difference
+        // between them beyond the pixels.
+        let wait_handle = match &present {
+            Present::D3d(d) => d.waitable,
+            Present::Gdi => sh2.vblank_ev.load(Relaxed) as HANDLE,
+        };
+
         let pump = Pump {
             sh: sh2.clone(), core: core2, hwnd: Cell::new(hwnd), dyn_: d.clone(),
             cursor,
+            present: core::cell::RefCell::new(present),
+            wait_handle,
             buttons: Cell::new(0), last_refresh: Cell::new(0), last_tick_ns: Cell::new(0), have_refresh: Cell::new(false),
             in_size_move: Cell::new(false), cursor_hidden: Cell::new(false), fs_applied: Cell::new(false),
             saved_rect: Cell::new(RECT::default()), saved_style: Cell::new(0), saved_ex: Cell::new(0),
@@ -903,10 +1003,15 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
         unsafe { ShowWindow(hwnd, SW_SHOW); UpdateWindow(hwnd); }
         pump.update_size();
 
-        let mode = choose_vsync(&d);
-        if dbg { eprintln!("softer_gui: vsync {:?}, period {} fs ({:.3} Hz)", mode, period, FS as f64 / period as f64); }
-        let shv = sh2.clone();
-        let vb = std::thread::Builder::new().name("softer_gui-win-vblank".into()).spawn(move || vblank_thread(shv, mode)).ok();
+        let vb = if use_d3d {
+            if dbg { eprintln!("softer_gui: presenter d3d11 flip-model, waitable object, period {} fs ({:.3} Hz)", period, FS as f64 / period as f64); }
+            None
+        } else {
+            let mode = choose_vsync(&d);
+            if dbg { eprintln!("softer_gui: presenter gdi, vsync {:?}, period {} fs ({:.3} Hz)", mode, period, FS as f64 / period as f64); }
+            let shv = sh2.clone();
+            std::thread::Builder::new().name("softer_gui-win-vblank".into()).spawn(move || vblank_thread(shv, mode)).ok()
+        };
 
         *sh2.ready.lock().unwrap() = 1;
         sh2.ready_cv.notify_all();

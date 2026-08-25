@@ -68,6 +68,8 @@ pub mod sys_win;
 #[cfg(any(target_os = "windows", cosmo))]
 mod scancode_win;
 #[cfg(any(target_os = "windows", cosmo))]
+mod win_d3d;
+#[cfg(any(target_os = "windows", cosmo))]
 mod win;
 
 pub use event::*;

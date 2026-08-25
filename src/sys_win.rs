@@ -475,6 +475,8 @@ macro_rules! win_fn_types {
     };
 }
 
+pub(crate) use win_fn_types;
+
 win_fn_types! {
     FnDwmGetCompositionTimingInfo = fn(HWND, *mut DWM_TIMING_INFO) -> i32;
     FnDwmFlush = fn() -> i32;

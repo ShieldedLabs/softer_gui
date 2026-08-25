@@ -89,7 +89,11 @@ whole of a modal resize drag. Same polling API on every platform.
 
 * X11: verified on Xorg 60.0010 Hz — contiguous msc, one present per vblank,
   resize/regrow, text (layout groups, shift, repeat), XI2 scroll, buttons, cursor hide.
-* Windows: verified on Windows 11 at 60.000 Hz, `x86_64-pc-windows-msvc`. Display
+* Windows: two presenters, verified on Windows 11 at 60.000 Hz,
+  `x86_64-pc-windows-msvc`. The capable one (D3D11 flip model, 8.1+) held 481 of
+  481 intervals at exactly one period with +1.7 ms drift over 8 s; the compatible
+  one (GDI, Vista baseline) 480 of 480 at -11 ms. Both pass all 28 checks in
+  `examples/wintest.rs`. Display
   time locked to the display (6 s, 0 dropped vblanks, 0 duplicate timestamps, drift
   stable rather than accumulating); deliberately stalled frames reported as exactly
   the right number of whole periods; scancode table, layout text, shift, pointer,
@@ -193,14 +197,62 @@ drive themselves.
 cargo build --release --target x86_64-pc-windows-msvc
 ```
 
-The backend is GDI (`CreateDIBSection` plus `BitBlt`), not a DXGI flip-model
-swapchain. The swapchain is the better answer on a Windows 10 floor and the wrong
-one here, because it does not exist before Windows 8. What makes GDI affordable is
-that the display clock does not have to come from the presentation path: GDI
-reports no timing at any Windows version, but `DwmGetCompositionTimingInfo` (Vista
-and up) hands out an exact refresh rational and `cRefresh`, a monotonic vblank
-counter that is the direct analog of X11 Present's MSC. See the header of
-`src/win.rs` for the full argument, the fallbacks, and the known limitations.
+There are two Windows presenters in one binary, picked at run time. They are not
+a fast path and a slow path; they are a compatible one and a capable one, tuned
+separately, because the interesting APIs and the wide install base do not overlap.
+
+| | compatible | capable |
+|---|---|---|
+| floor | **Vista** | **Windows 8.1** |
+| pixels | `CreateDIBSection` + `BitBlt` | D3D11 texture into a DXGI flip-model swapchain |
+| copies to screen | via DWM's redirection surface | straight to DWM, no redirection copy |
+| "render now" signal | vblank thread (`DwmFlush`) | the swapchain's waitable object |
+| threads | pump + vblank + app | pump + app |
+| `Core::in_flight` | inert | real, from `PresentCount` |
+
+`SOFTER_GUI_WIN=gdi` forces the compatible one (which is how the Vista-era code
+stays testable on a machine that is not Vista); `=d3d` asks for the capable one.
+Left alone, the capable one is tried and any failure at all falls back, because
+every way it can fail has the same answer.
+
+Measured on Windows 11 at 60 Hz, 8 s, `winpace`:
+
+* capable: 481 intervals, **every one exactly one period**, drift **+1.7 ms**.
+* compatible: 480 intervals, every one exactly one period, drift −11 ms.
+* both report a deliberately stalled frame as exactly the periods it cost.
+
+**Why 8.1 and not 8.** Flip model and `GetFrameStatistics` are Windows 8, but
+`IDXGISwapChain2::GetFrameLatencyWaitableObject` is 8.1, and that wait is the
+whole reason to go there: it means "start now to land on the next vblank" rather
+than "a vblank happened". 8.0 without 8.1 is a rounding error of an install base,
+so the extra floor costs nothing and buys the primitive this crate exists for.
+
+**The part that is not obvious, and cost a measurement.** The capable path looks
+like it should take its clock from the swapchain, since `PresentRefreshCount` is a
+true per-present MSC. It cannot: DXGI updates those counters in bursts, sitting
+still for about sixty calls and then jumping sixty at once. Pacing off that delta
+ticks 1 while it is stalled and then 60 in one go, which ran display time **931 ms
+ahead** of the wall clock over eight seconds while every individual frame looked
+fine. So each source is used for what it is good at. The swapchain gives the WAIT,
+which DWM cannot, and the count of presents still in flight. DWM's `cRefresh`
+gives the CLOCK, live every frame. What the swapchain measures stays the fallback
+for a host with no composition.
+
+That split is also what makes this path the closest thing on Windows to the X11
+backend: the waitable object is PresentCompleteNotify's "ready for another", the
+refresh counter is its `msc`, and `PresentCount` is what makes `Core::in_flight`
+mean the same thing it means on Linux.
+
+The compatible path keeps the whole argument for GDI: the display clock does not
+have to come from the presentation path. GDI reports no timing at any Windows
+version, but `DwmGetCompositionTimingInfo` (Vista and up) hands out an exact
+refresh rational and `cRefresh`. See the headers of `src/win.rs` and
+`src/win_d3d.rs` for the rest, including the fallbacks and known limitations.
+
+A cosmopolitan APE defaults to the compatible presenter. D3D11 brings its own
+threads, thread-local storage and COM apartments into a process whose libc was
+swapped underneath it, and measured here it takes an int3 inside `d3d11.dll`
+before returning a device. Portability keeps the presenter that is portable.
 
 ### How far down it actually runs
 
