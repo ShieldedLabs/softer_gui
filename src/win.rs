@@ -330,6 +330,11 @@ struct Pump {
     buttons: Cell<u32>,
     last_refresh: Cell<u64>,
     last_tick_ns: Cell<u64>,
+    /// QPC when the vblank wait last returned, and the running cost of getting
+    /// from there to a present. That interval is the part of the frame's latency
+    /// this crate owns: everything else belongs to DWM or the driver.
+    wake_qpc: Cell<i64>,
+    hop_n: Cell<u32>, hop_sum: Cell<i64>, hop_max: Cell<i64>,
     have_refresh: Cell<bool>,
     in_size_move: Cell<bool>,
     cursor_hidden: Cell<bool>,
@@ -579,6 +584,22 @@ impl Pump {
         };
         let Some(s) = g.as_ref() else { return };
         self.sh.dirty.store(false, Release);
+        let wake = self.wake_qpc.get();
+        if wake != 0 {
+            let d = qpc() - wake;
+            self.wake_qpc.set(0);
+            if d > 0 {
+                let us = d * 1_000_000 / qpf();
+                self.hop_n.set(self.hop_n.get() + 1);
+                self.hop_sum.set(self.hop_sum.get() + us);
+                if us > self.hop_max.get() { self.hop_max.set(us); }
+                if self.debug && self.hop_n.get() % 64 == 0 {
+                    eprintln!("softer_gui: wake->present n={} mean={}us max={}us",
+                              self.hop_n.get(), self.hop_sum.get() / self.hop_n.get() as i64,
+                              self.hop_max.get());
+                }
+            }
+        }
         let Ok(mut pres) = self.present.try_borrow_mut() else { return };
         match &mut *pres {
             Present::D3d(d) => {
@@ -858,7 +879,12 @@ impl Pump {
             // above and this wait is marked already-seen and we sleep through it,
             // which shows up as a window that occasionally stops responding.
             let r = unsafe { MsgWaitForMultipleObjectsEx(1, &vblank, ms as u32, QS_ALLINPUT, MWMO_INPUTAVAILABLE) };
-            if r == WAIT_OBJECT_0 { self.frame_tick(false); }
+            if r == WAIT_OBJECT_0 {
+                // The waitable fires meaning "render now and you will make the
+                // next vblank". Everything between here and Present is ours.
+                self.wake_qpc.set(qpc());
+                self.frame_tick(false);
+            }
         }
         unsafe {
             let b = self.icon_big.get(); if b != 0 { DestroyIcon(b as HICON); }
@@ -993,7 +1019,8 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
             cursor,
             present: core::cell::RefCell::new(present),
             wait_handle,
-            buttons: Cell::new(0), last_refresh: Cell::new(0), last_tick_ns: Cell::new(0), have_refresh: Cell::new(false),
+            buttons: Cell::new(0), last_refresh: Cell::new(0), last_tick_ns: Cell::new(0),
+            wake_qpc: Cell::new(0), hop_n: Cell::new(0), hop_sum: Cell::new(0), hop_max: Cell::new(0), have_refresh: Cell::new(false),
             in_size_move: Cell::new(false), cursor_hidden: Cell::new(false), fs_applied: Cell::new(false),
             saved_rect: Cell::new(RECT::default()), saved_style: Cell::new(0), saved_ex: Cell::new(0),
             icon_big: Cell::new(0), icon_small: Cell::new(0),
