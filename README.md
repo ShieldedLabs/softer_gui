@@ -331,6 +331,38 @@ scanout, not input to photons, which also includes the frame the app spends
 drawing. `SOFTER_GUI_DEBUG=1` prints it, so the same question can be asked on
 AMD and Intel.
 
+### Getting the latency down
+
+Those numbers are all windowed, and windowed is the expensive case. A windowed
+flip-model present goes to DWM, DWM composites it, and the composited result
+scans out at the FOLLOWING vblank; that second frame is the compositor, not this
+crate. Cover the screen and DWM can hand the swapchain straight to the display
+controller instead (independent flip), and the frame disappears.
+
+`SOFTER_GUI_FULLSCREEN=1` makes the demo and `winpace` start borderless
+fullscreen, which is the same thing F11 does, so the difference is measurable:
+
+| | windowed | fullscreen |
+|---|---|---|
+| native, hardware driver | 32.55 ms | **9.6 ms** |
+| native, WARP | 32.74 ms | 25.7 ms |
+| APE, WARP | 32.65 ms | 28.1 ms |
+
+Fullscreen on the hardware driver is worth **23 ms**, better than three times,
+and lands under a single refresh period (best sample 3.3 ms). WARP gets a
+smaller share of it, around 5 to 7 ms, which fits what WARP is: it rasterises
+into system memory, so something still has to move the result somewhere the
+display controller can scan out, and that is the part independent flip would
+otherwise have removed. An APE is inside 2 ms of native WARP either way.
+
+So the order of the levers is: go fullscreen, and use a hardware driver if you
+can. An APE cannot (see above), which puts its floor at WARP's.
+
+Below that there is only tearing, `DXGI_PRESENT_ALLOW_TEARING` with
+`Present(0, ...)`, which would go sub-frame and is not implemented: it would
+break the property the whole crate is built on, that display time advances in
+whole refresh periods.
+
 ### How far down it actually runs
 
 The backend itself is written to a **Vista** baseline: everything in a `#[link]`

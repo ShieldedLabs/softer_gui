@@ -81,6 +81,11 @@ fn main() {
 }
 
 fn app(mut gui: Gui) {
+    // Same thing F11 does, but reachable without a keyboard. Fullscreen is what
+    // lets DWM hand the swapchain to the display controller instead of
+    // compositing it, which is worth most of a frame of latency on Windows, so
+    // it has to be measurable from a script.
+    if std::env::var("SOFTER_GUI_FULLSCREEN").is_ok() { gui.set_fullscreen(true); }
     let period = gui.period_fs();
     println!("demo: window {}x{}, period {} fs ({:.4} Hz)", gui.window_size().0, gui.window_size().1, period, 1e15 / period as f64);
 

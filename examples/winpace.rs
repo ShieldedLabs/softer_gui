@@ -32,7 +32,14 @@ fn main() {
     println!("winpace: period {period} fs ({:.4} Hz), stalling every {stall_every} frames for {seconds}s",
              1e15 / period as f64);
 
+    // SOFTER_GUI_FULLSCREEN=1 asks for borderless fullscreen, which is what
+    // lets DWM hand the swapchain straight to the display controller (independent
+    // flip) instead of compositing it. That is worth a whole frame of latency, so
+    // the difference is worth being able to measure.
+    if std::env::var("SOFTER_GUI_FULLSCREEN").is_ok() { gui.set_fullscreen(true); }
+
     let mut ev = Event::default();
+    let mut reported_size = (0u32, 0u32);
     let mut frames = 0u64;
     let mut last_t: u128 = 0;
     let mut first_t: u128 = 0;
@@ -47,7 +54,7 @@ fn main() {
             match ev.kind {
                 EVENT_CLOSE => break 'outer,
                 EVENT_RENDER => {
-                    if first_t == 0 { first_t = ev.t_fs; }
+                    if first_t == 0 { first_t = ev.t_fs; reported_size = (ev.width, ev.height); }
                     if last_t != 0 {
                         let n = ((ev.t_fs - last_t) / ev.dt_fs as u128) as usize;
                         if n < gaps.len() { gaps[n] += 1 } else { over += 1 }
@@ -74,6 +81,7 @@ fn main() {
     }
 
     let wall = start.elapsed().as_secs_f64();
+    println!("winpace: window {}x{} at exit (started {}x{})", gui.window_size().0, gui.window_size().1, reported_size.0, reported_size.1);
     let disp = (last_t - first_t) as f64 / 1e15;
     println!("winpace: {frames} frames, wall {wall:.3}s, display {disp:.3}s, drift {:+.1}ms", (disp - wall) * 1e3);
     print!("winpace: gap histogram (periods:count)");
