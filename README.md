@@ -304,10 +304,32 @@ crash and not an error return, so an APE never asks for hardware at all.
 `SOFTER_GUI_D3D_DRIVER=hardware` retests it on other GPUs; measured here on
 NVIDIA.
 
-It costs nothing worth having. The GPU work in this crate is one copy per frame,
-not a scene, so a software rasteriser is not doing less of anything: measured on
-the APE, 360 of 360 intervals at exactly one period, drift **-0.0 ms** over 6 s,
-which is the best of any configuration here, native included.
+It costs nothing worth having, and that is measured rather than assumed. The GPU
+work in this crate is one copy per frame, not a scene, so a software rasteriser
+is not doing less of anything. Pacing on the APE: 360 of 360 intervals at exactly
+one period, drift **-0.0 ms** over 6 s.
+
+Latency is a separate question, because pacing does not imply it: a gap histogram
+says no frame was dropped and says nothing about how many vblanks a frame sat in
+the pipeline first. Measured through DXGI's `PresentRefreshCount` against the
+`SyncQPCTime`/`SyncRefreshCount` pair, three runs of 12 s each at 60 Hz:
+
+| | mean submit-to-scanout |
+|---|---|
+| native, hardware driver | 32.55 ms |
+| native, WARP | 32.74 ms |
+| APE, WARP | 33.02 ms |
+
+So an APE with WARP costs about **0.5 ms** against the best native path, three
+per cent of one refresh period, and WARP against hardware is 0.2 ms of that. All
+three sit near two refresh periods, which is what a flip-model present with one
+frame of allowed latency looks like.
+
+Two caveats. One early hardware run measured 17.6 ms, a single period, and never
+reproduced; do not read it as a hardware advantage. And this is submit to
+scanout, not input to photons, which also includes the frame the app spends
+drawing. `SOFTER_GUI_DEBUG=1` prints it, so the same question can be asked on
+AMD and Intel.
 
 ### How far down it actually runs
 

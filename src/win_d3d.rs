@@ -262,6 +262,12 @@ pub struct D3d {
     submitted: u32,
     /// Presents submitted but not yet shown; published to Core::in_flight.
     pub in_flight: u32,
+    /// QPC at the moment each present was handed to DXGI, indexed by present
+    /// number. Only needed to answer "how long was that frame in the pipe".
+    submit_qpc: [i64; 256],
+    /// Submit-to-scanout samples, microseconds.
+    lat_n: u32, lat_sum: i64, lat_min: i64, lat_max: i64,
+    last_stat_present: u32,
     pub occluded: bool,
     debug: bool,
     dbg_n: u32,
@@ -392,6 +398,8 @@ impl D3d {
 
             Some(D3d { device, ctx, swap, tex: core::ptr::null_mut(), tex_side: 0,
                        waitable, last_refresh: 0, last_present: 0, have_refresh: false, owed: 0, submitted: 0, in_flight: 0,
+                       submit_qpc: [0; 256], lat_n: 0, lat_sum: 0, lat_min: i64::MAX, lat_max: 0,
+                       last_stat_present: 0,
                        occluded: false, debug, dbg_n: 0 })
         }
     }
@@ -446,6 +454,9 @@ impl D3d {
             ((*ctxv).copy_subresource_region)(self.ctx, back, 0, 0, 0, 0, self.tex, 0, &box_);
             release(back);
 
+            // Stamped before the call: this is the moment the frame stops being
+            // ours and starts waiting on the display.
+            self.submit_qpc[(self.submitted.wrapping_add(1) & 255) as usize] = qpc();
             let hr = ((*scv).present)(self.swap, 1, 0);
             self.submitted = self.submitted.wrapping_add(1);
             self.occluded = hr == DXGI_STATUS_OCCLUDED;
@@ -472,7 +483,7 @@ impl D3d {
     /// to telling us. So: charge one period for the frame in hand, and add the
     /// shortfall when it shows up. Steady state is 1 per frame regardless of when
     /// DXGI feels like updating, and a real drop is still counted, just late.
-    pub fn frames_elapsed(&mut self) -> u64 {
+    pub fn frames_elapsed(&mut self, period_qpc: i64) -> u64 {
         unsafe {
             let mut st = DXGI_FRAME_STATISTICS::default();
             let hr = ((*vt::<IDXGISwapChain2Vtbl>(self.swap)).get_frame_statistics)(self.swap, &mut st);
@@ -494,6 +505,42 @@ impl D3d {
                 self.last_present = st.PresentCount;
                 self.have_refresh = true;
             }
+            // Submit-to-scanout, for the one present DXGI just told us about.
+            //
+            // Pacing does not imply latency: the gap histogram says no frame was
+            // dropped and the clock is right, and says nothing about how many
+            // vblanks a frame sat in the pipeline first. These statistics can
+            // answer that from inside the process. PresentRefreshCount is the
+            // vblank an image went up at, and SyncRefreshCount with SyncQPCTime is
+            // a vblank/QPC pair the scheduler sampled, so walking back from the
+            // pair by the refresh period turns the first into an instant to
+            // difference against when Present was called. Same correlation
+            // PresentMon makes.
+            if period_qpc > 0 && st.PresentCount != self.last_stat_present && st.PresentCount != 0 {
+                self.last_stat_present = st.PresentCount;
+                let behind = st.SyncRefreshCount as i64 - st.PresentRefreshCount as i64;
+                if (0..600).contains(&behind) {
+                    let shown_qpc = st.SyncQPCTime - behind * period_qpc;
+                    // PresentCount and our own counter are the same numbering:
+                    // measured, their difference holds at the frames in flight.
+                    let sent = self.submit_qpc[(st.PresentCount & 255) as usize];
+                    if sent != 0 && shown_qpc > sent {
+                        let us = (shown_qpc - sent) * 1_000_000 / qpf();
+                        // A whole second of "latency" is a stale ring slot, not a frame.
+                        if us < 1_000_000 {
+                            self.lat_n += 1;
+                            self.lat_sum += us;
+                            self.lat_min = self.lat_min.min(us);
+                            self.lat_max = self.lat_max.max(us);
+                            if self.debug && self.lat_n % 8 == 0 {
+                                eprintln!("softer_gui: latency submit->scanout n={} mean={}us min={}us max={}us",
+                                          self.lat_n, self.lat_sum / self.lat_n as i64, self.lat_min, self.lat_max);
+                            }
+                        }
+                    }
+                }
+            }
+
             // One period for this frame, plus a little of what is owed.
             let take = self.owed.min(7);
             self.owed -= take;

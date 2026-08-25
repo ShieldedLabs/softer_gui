@@ -631,7 +631,10 @@ impl Pump {
         let mut d3d_frames: Option<u64> = None;
         if let Ok(mut pres) = self.present.try_borrow_mut() {
             if let Present::D3d(d) = &mut *pres {
-                d3d_frames = Some(d.frames_elapsed());
+                // Refresh period in QPC ticks, so the presenter can turn DXGI's
+                // vblank indices into instants.
+                let period_qpc = (self.sh.period_fs.load(Relaxed) as i128 * qpf() as i128 / 1_000_000_000_000_000i128) as i64;
+                d3d_frames = Some(d.frames_elapsed(period_qpc));
                 // Presents submitted but not yet shown: the same quantity the X11
                 // backend keeps from PresentCompleteNotify, and the reason
                 // Core::in_flight is meaningful on this path and inert on the other.
