@@ -144,10 +144,10 @@ bin = "demo"                      # what the .com is built from
 ape = ["dep:cosmo-build"]
 
 [build-dependencies]
-cosmo-build = { version = "3", optional = true }
+cosmo-build = { version = "4", optional = true }
 
 [target.'cfg(cosmo)'.dependencies]
-cosmo-compat = "3"
+cosmo-compat = "4"
 ```
 
 ```rust

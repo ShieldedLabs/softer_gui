@@ -32,11 +32,11 @@ bin = "demo"
 ape = ["dep:cosmo-build"]
 
 [build-dependencies]
-cosmo-build = { version = "3", optional = true }
+cosmo-build = { version = "4", optional = true }
 
 # The libc shim, scoped to cfg(cosmo), which cosmo-build sets.
 [target.'cfg(cosmo)'.dependencies]
-cosmo-compat = "3"
+cosmo-compat = "4"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(cosmo)'] }

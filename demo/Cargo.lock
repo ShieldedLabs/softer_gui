@@ -59,9 +59,9 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "cosmo-build"
-version = "3.0.0"
+version = "4.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14d2b1c968b1d66d4143e1063d6a18ea7aa3133900eb6cee7454151d72805d0c"
+checksum = "25a1de2731c9f3cfd5050a1cd97b96a21df453af883fd4a117b97044ca6f482c"
 dependencies = [
  "sha2",
  "ureq",
@@ -70,9 +70,9 @@ dependencies = [
 
 [[package]]
 name = "cosmo-compat"
-version = "3.0.0"
+version = "4.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70c9404bf61058062255a42cf57a6389ee34fe216d0b4e77cc4637c732063cb1"
+checksum = "c7626775056fceffe5bffc6388a79d794ba4252710a32e9ce6d325430526dafe"
 
 [[package]]
 name = "cpufeatures"
@@ -307,7 +307,7 @@ checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
 name = "softer_gui"
-version = "1.0.0"
+version = "1.0.1"
 
 [[package]]
 name = "softer_gui_demo"
