@@ -60,11 +60,14 @@ mod wayland;
 mod mac_sys;
 #[cfg(any(target_os = "macos", cosmo))]
 mod mac;
-#[cfg(target_os = "windows")]
+// And the same again for Windows: an APE may land there too, so the Win32
+// backend is compiled in and chosen at run time, with its imports coming from
+// cosmo_dlsym rather than an import table (see the win32! macro in sys_win.rs).
+#[cfg(any(target_os = "windows", cosmo))]
 pub mod sys_win;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", cosmo))]
 mod scancode_win;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", cosmo))]
 mod win;
 
 pub use event::*;
@@ -81,7 +84,7 @@ enum Backend {
     Wayland(wayland::App),
     #[cfg(any(target_os = "macos", cosmo))]
     Mac(mac::App),
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", cosmo))]
     Win(win::App),
 }
 
@@ -122,6 +125,11 @@ pub fn open(title: &str, app_id: &str, width: u32, height: u32) -> Option<Gui> {
         let _ = app_id;
         return open_mac(core, title, width, height);
     }
+    #[cfg(cosmo)]
+    if sys_win::cosmo::is_windows() {
+        let app = win::open(core.clone(), title, app_id, width, height)?;
+        return Some(Gui { core, back: Backend::Win(app) });
+    }
     #[cfg(any(target_os = "linux", cosmo))]
     {
         let force_x11 = std::env::var("SOFTER_GUI_X11").map(|v| v == "1").unwrap_or(false);
@@ -138,7 +146,7 @@ pub fn open(title: &str, app_id: &str, width: u32, height: u32) -> Option<Gui> {
         let _ = app_id;
         open_mac(core, title, width, height)
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", not(cosmo)))]
     {
         let app = win::open(core.clone(), title, app_id, width, height)?;
         Some(Gui { core, back: Backend::Win(app) })
@@ -173,7 +181,7 @@ impl Gui {
             Backend::Wayland(a) => a.get_framebuffer(),
             #[cfg(any(target_os = "macos", cosmo))]
             Backend::Mac(a) => a.get_framebuffer(),
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", cosmo))]
             Backend::Win(a) => a.get_framebuffer(),
         };
         let Some((ptr, side, key)) = got else { return Framebuffer { pixels: core::ptr::null_mut(), side: 0, width: 0, height: 0, key: 0 } };
@@ -191,7 +199,7 @@ impl Gui {
             Backend::Wayland(a) => a.submit(),
             #[cfg(any(target_os = "macos", cosmo))]
             Backend::Mac(a) => a.submit(),
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", cosmo))]
             Backend::Win(a) => a.submit(),
         }
     }
@@ -213,7 +221,7 @@ impl Gui {
         match &self.back {
             #[cfg(target_os = "linux")]
             Backend::Wayland(a) => a.poke(),
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", cosmo))]
             Backend::Win(a) => a.poke(),
             #[allow(unreachable_patterns)]
             _ => {}

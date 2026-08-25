@@ -116,9 +116,13 @@ to this repo:
 
 ```
 PATH=../cargo_cosmo/tools:../cargo_cosmo/toolchain/cosmocc/bin:$PATH \
+CARGO_COSMO_TOOLCHAIN=nightly-2026-08-23 \
   cargo cosmo build --release --features cosmo --example demo
 sh target/cosmo/demo.com          # x86-64 + arm64 in one file
 ```
+
+(`CARGO_COSMO_TOOLCHAIN` is how the driver is told to ignore this repo's stable
+pin, which applies to native builds only.)
 
 Under `cfg(cosmo)` (set by the driver) `src/sys_cosmo.rs` replaces the raw
 syscalls with calls into cosmo's libc, so cosmo picks syscall numbers, struct
@@ -127,6 +131,27 @@ X11/Wayland wire code is unchanged. Verified on Linux/X11 at the same 60.0010 Hz
 as the native build. The `cosmo` feature pulls in cargo_cosmo's `cosmo-compat`
 libc shim; this needs cargo_cosmo's pinned nightly (custom target specs), the
 stable pin here applies to native builds only.
+
+**That same file runs on Windows**, verified on Windows 11: 720 frames,
+0 dropped vblanks, 0 duplicate timestamps, 60.000 Hz, −16.7 ms drift held flat
+over 12 s, which is the native MSVC build's own result on that machine. The APE
+was built on Linux and copied across.
+
+The shape matches the macOS port exactly: `open()` asks `__hostos`, and
+`src/sys_win.rs` declares each Win32 import once through a `win32!` macro that
+emits a real `#[link]` import in a native build and a `cosmo_dlsym`'d, cached
+wrapper in an APE, so `src/win.rs` reads the same either way and nothing is
+dlopen'd unless the program woke up on Windows.
+
+One hazard has no macOS counterpart and is worth stating on its own: **the
+calling convention.** In a cosmo build the target is linux, so `extern "system"`
+means SysV, with arguments in RDI/RSI and no shadow space. Win32 wants the
+Microsoft x64 convention. The call therefore arrives inside user32 reading
+whatever happened to be in RCX, and segfaults there while holding a perfectly
+valid function pointer, which looks like a bad symbol and is not. Every import,
+every `GetProcAddress`'d pointer, and the window procedure Windows calls back
+need `extern "win64"` on x86-64. aarch64 needs nothing: Windows and Linux share
+AAPCS64.
 
 **That same file runs on macOS**, verified on macOS 15.7.2 / Apple Silicon:
 1,200 frames, 0 skipped, 0 dropped vblanks, 120.0006 Hz, −8.4 ms drift over

@@ -801,7 +801,18 @@ impl Pump {
     }
 }
 
+/// Two shims over one body, because the ABI is not the same in both builds and an
+/// ABI cannot be selected by attribute. See WNDPROC in sys_win.rs.
+#[cfg(not(all(cosmo, target_arch = "x86_64")))]
 unsafe extern "system" fn wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    unsafe { wndproc_impl(h, msg, w, l) }
+}
+#[cfg(all(cosmo, target_arch = "x86_64"))]
+unsafe extern "win64" fn wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    unsafe { wndproc_impl(h, msg, w, l) }
+}
+
+unsafe fn wndproc_impl(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     let p = PUMP.with(|c| c.get());
     // Messages arrive during CreateWindowExW, before the pointer is published.
     if p.is_null() { return unsafe { DefWindowProcW(h, msg, w, l) }; }

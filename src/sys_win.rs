@@ -31,6 +31,10 @@ pub type WPARAM = usize;
 pub type LPARAM = isize;
 pub type LRESULT = isize;
 pub type BOOL = i32;
+/// Windows calls this one, so it carries the same ABI caveat as the imports.
+#[cfg(all(cosmo, target_arch = "x86_64"))]
+pub type WNDPROC = unsafe extern "win64" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT;
+#[cfg(not(all(cosmo, target_arch = "x86_64")))]
 pub type WNDPROC = unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT;
 
 pub const NULL: HANDLE = core::ptr::null_mut();
@@ -267,77 +271,181 @@ pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
 pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE: isize = -3;
 
 // ---- Vista-and-older imports ---------------------------------------------------
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    pub fn GetModuleHandleW(name: *const u16) -> HMODULE;
-    pub fn LoadLibraryW(name: *const u16) -> HMODULE;
-    pub fn GetProcAddress(m: HMODULE, name: *const u8) -> *const c_void;
-    pub fn QueryPerformanceCounter(v: *mut i64) -> BOOL;
-    pub fn QueryPerformanceFrequency(v: *mut i64) -> BOOL;
-    pub fn CreateEventW(sa: *mut c_void, manual: BOOL, initial: BOOL, name: *const u16) -> HANDLE;
-    pub fn SetEvent(h: HANDLE) -> BOOL;
-    pub fn CloseHandle(h: HANDLE) -> BOOL;
-    pub fn Sleep(ms: u32);
-    pub fn GetLastError() -> u32;
+
+// ---- how a Win32 import is bound ------------------------------------------------
+/// Declare each import once and get whichever binding form the build needs.
+///
+/// Native Windows: an ordinary `#[link]` import that the PE loader fills in. Free,
+/// and exactly what this file did before cosmo existed.
+///
+/// Cosmopolitan: there is no import table for the loader to fill, because the APE
+/// is one file that becomes a PE only at run time, and it cannot name a DLL at
+/// link time without giving up being an ELF everywhere else. So each symbol is
+/// fetched with `cosmo_dlsym` on first call and cached in an atomic. The call
+/// sites are byte-identical either way, which is the whole point: win.rs never
+/// learns which kind of build it is in.
+macro_rules! win32 {
+    ($( $lib:literal => { $( $(#[$m:meta])* fn $name:ident($($arg:ident: $ty:ty),* $(,)?) $(-> $ret:ty)?; )* } )*) => {
+        $(
+            #[cfg(not(cosmo))]
+            #[link(name = $lib)]
+            unsafe extern "system" {
+                $( $(#[$m])* pub fn $name($($arg: $ty),*) $(-> $ret)?; )*
+            }
+            $(
+                #[cfg(cosmo)]
+                $(#[$m])*
+                #[inline]
+                pub unsafe fn $name($($arg: $ty),*) $(-> $ret)? {
+                    // NOT `extern "system"`. In a cosmo build the target is linux,
+                    // where `system` means SysV: arguments in RDI/RSI/RDX/RCX and no
+                    // shadow space. Win32 wants the Microsoft x64 convention, so the
+                    // call lands inside user32 reading whatever happened to be in
+                    // RCX. That is a segfault deep in a system DLL with a perfectly
+                    // valid function pointer, which is a memorable afternoon.
+                    // aarch64 needs no such note: Windows and Linux share AAPCS64.
+                    #[cfg(target_arch = "x86_64")]
+                    type Sig = unsafe extern "win64" fn($($ty),*) $(-> $ret)?;
+                    #[cfg(not(target_arch = "x86_64"))]
+                    type Sig = unsafe extern "C" fn($($ty),*) $(-> $ret)?;
+                    static CACHE: core::sync::atomic::AtomicPtr<c_void> =
+                        core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+                    let mut f = CACHE.load(core::sync::atomic::Ordering::Relaxed);
+                    if f.is_null() {
+                        f = cosmo::sym(concat!($lib, ".dll\0"), concat!(stringify!($name), "\0"));
+                        CACHE.store(f, core::sync::atomic::Ordering::Relaxed);
+                    }
+                    unsafe { core::mem::transmute::<*mut c_void, Sig>(f)($($arg),*) }
+                }
+            )*
+        )*
+    };
 }
 
-#[link(name = "user32")]
-unsafe extern "system" {
-    pub fn RegisterClassExW(c: *const WNDCLASSEXW) -> u16;
-    pub fn CreateWindowExW(ex: u32, class: *const u16, title: *const u16, style: u32,
+/// The two cosmopolitan primitives this backend stands on, and nothing more.
+///
+/// `__hostos` is a word in BSS that cosmo's runtime fills in before main with the
+/// OS it actually landed on, which is the only honest way to choose a backend in a
+/// binary whose `target_os` is a compile-time fiction. `cosmo_dlopen`/`cosmo_dlsym`
+/// reach the host's own shared libraries, which on Windows means user32 and gdi32.
+#[cfg(cosmo)]
+pub mod cosmo {
+    use core::ffi::{c_char, c_void};
+
+    unsafe extern "C" {
+        static __hostos: i32;
+        fn cosmo_dlopen(path: *const c_char, mode: i32) -> *mut c_void;
+        fn cosmo_dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
+    }
+
+    // cosmo's own numbering, confirmed by cargo_cosmo's cross-os probe.
+    pub const HOST_LINUX: i32 = 1;
+    pub const HOST_WINDOWS: i32 = 4;
+
+    pub fn host_os() -> i32 { unsafe { __hostos } }
+    pub fn is_windows() -> bool { host_os() == HOST_WINDOWS }
+
+    /// Resolve one export. Both arguments must already be nul-terminated.
+    ///
+    /// Panics rather than returning null: a missing user32 export on a Windows host
+    /// is not a condition any caller can do anything about, and transmuting null
+    /// into a function would crash somewhere far less informative.
+    pub fn sym(lib: &str, name: &str) -> *mut c_void {
+        unsafe {
+            let h = cosmo_dlopen(lib.as_ptr() as *const c_char, 1);   // RTLD_LAZY
+            if h.is_null() { panic!("softer_gui: cosmo_dlopen({}) failed", lib.trim_end_matches('\0')); }
+            let f = cosmo_dlsym(h, name.as_ptr() as *const c_char);
+            if f.is_null() {
+                panic!("softer_gui: cosmo_dlsym({}, {}) failed",
+                       lib.trim_end_matches('\0'), name.trim_end_matches('\0'));
+            }
+            f
+        }
+    }
+}
+
+win32! {
+    "kernel32" => {
+    fn GetModuleHandleW(name: *const u16) -> HMODULE;
+    fn LoadLibraryW(name: *const u16) -> HMODULE;
+    fn GetProcAddress(m: HMODULE, name: *const u8) -> *const c_void;
+    fn QueryPerformanceCounter(v: *mut i64) -> BOOL;
+    fn QueryPerformanceFrequency(v: *mut i64) -> BOOL;
+    fn CreateEventW(sa: *mut c_void, manual: BOOL, initial: BOOL, name: *const u16) -> HANDLE;
+    fn SetEvent(h: HANDLE) -> BOOL;
+    fn CloseHandle(h: HANDLE) -> BOOL;
+    fn Sleep(ms: u32);
+    fn GetLastError() -> u32;
+    }
+    "user32" => {
+    fn RegisterClassExW(c: *const WNDCLASSEXW) -> u16;
+    fn CreateWindowExW(ex: u32, class: *const u16, title: *const u16, style: u32,
                            x: i32, y: i32, w: i32, h: i32,
                            parent: HWND, menu: HANDLE, inst: HMODULE, param: *mut c_void) -> HWND;
-    pub fn DestroyWindow(h: HWND) -> BOOL;
-    pub fn DefWindowProcW(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT;
-    pub fn ShowWindow(h: HWND, cmd: i32) -> BOOL;
-    pub fn UpdateWindow(h: HWND) -> BOOL;
-    pub fn PeekMessageW(m: *mut MSG, h: HWND, min: u32, max: u32, remove: u32) -> BOOL;
-    pub fn TranslateMessage(m: *const MSG) -> BOOL;
-    pub fn DispatchMessageW(m: *const MSG) -> LRESULT;
-    pub fn PostMessageW(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> BOOL;
-    pub fn SendMessageW(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT;
-    pub fn MsgWaitForMultipleObjectsEx(n: u32, handles: *const HANDLE, ms: u32, mask: u32, flags: u32) -> u32;
-    pub fn GetClientRect(h: HWND, r: *mut RECT) -> BOOL;
-    pub fn GetWindowRect(h: HWND, r: *mut RECT) -> BOOL;
-    pub fn AdjustWindowRectEx(r: *mut RECT, style: u32, menu: BOOL, ex: u32) -> BOOL;
-    pub fn SetWindowPos(h: HWND, after: HWND, x: i32, y: i32, w: i32, ht: i32, flags: u32) -> BOOL;
-    pub fn GetDC(h: HWND) -> HDC;
-    pub fn ReleaseDC(h: HWND, dc: HDC) -> i32;
-    pub fn BeginPaint(h: HWND, ps: *mut PAINTSTRUCT) -> HDC;
-    pub fn EndPaint(h: HWND, ps: *const PAINTSTRUCT) -> BOOL;
-    pub fn InvalidateRect(h: HWND, r: *const RECT, erase: BOOL) -> BOOL;
-    pub fn ValidateRect(h: HWND, r: *const RECT) -> BOOL;
-    pub fn SetWindowTextW(h: HWND, s: *const u16) -> BOOL;
-    pub fn SetCapture(h: HWND) -> HWND;
-    pub fn ReleaseCapture() -> BOOL;
-    pub fn ShowCursor(show: BOOL) -> i32;
-    pub fn SetCursor(c: HANDLE) -> HANDLE;
-    pub fn LoadCursorW(inst: HMODULE, name: usize) -> HANDLE;
-    pub fn GetKeyboardState(state: *mut u8) -> BOOL;
-    pub fn GetKeyboardLayout(thread: u32) -> HANDLE;
-    pub fn ToUnicodeEx(vk: u32, sc: u32, state: *const u8, buf: *mut u16, n: i32, flags: u32, hkl: HANDLE) -> i32;
-    pub fn MapVirtualKeyW(code: u32, map: u32) -> u32;
-    pub fn SystemParametersInfoW(action: u32, param: u32, ptr: *mut c_void, ini: u32) -> BOOL;
-    pub fn MonitorFromWindow(h: HWND, flags: u32) -> HMONITOR;
-    pub fn GetMonitorInfoW(m: HMONITOR, info: *mut MONITORINFO) -> BOOL;
-    pub fn EnumDisplaySettingsW(name: *const u16, mode: u32, dm: *mut DEVMODEW) -> BOOL;
-    pub fn CreateIconIndirect(info: *const ICONINFO) -> HICON;
-    pub fn DestroyIcon(i: HICON) -> BOOL;
-    pub fn ClientToScreen(h: HWND, p: *mut POINT) -> BOOL;
-    pub fn ScreenToClient(h: HWND, p: *mut POINT) -> BOOL;
-    pub fn GetCursorPos(p: *mut POINT) -> BOOL;
-    pub fn PostQuitMessage(code: i32);
-    pub fn SetTimer(h: HWND, id: usize, ms: u32, proc_: *const c_void) -> usize;
-    pub fn KillTimer(h: HWND, id: usize) -> BOOL;
+    fn DestroyWindow(h: HWND) -> BOOL;
+    fn DefWindowProcW(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT;
+    fn ShowWindow(h: HWND, cmd: i32) -> BOOL;
+    fn UpdateWindow(h: HWND) -> BOOL;
+    fn PeekMessageW(m: *mut MSG, h: HWND, min: u32, max: u32, remove: u32) -> BOOL;
+    fn TranslateMessage(m: *const MSG) -> BOOL;
+    fn DispatchMessageW(m: *const MSG) -> LRESULT;
+    fn PostMessageW(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> BOOL;
+    fn SendMessageW(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT;
+    fn MsgWaitForMultipleObjectsEx(n: u32, handles: *const HANDLE, ms: u32, mask: u32, flags: u32) -> u32;
+    fn GetClientRect(h: HWND, r: *mut RECT) -> BOOL;
+    fn GetWindowRect(h: HWND, r: *mut RECT) -> BOOL;
+    fn AdjustWindowRectEx(r: *mut RECT, style: u32, menu: BOOL, ex: u32) -> BOOL;
+    fn SetWindowPos(h: HWND, after: HWND, x: i32, y: i32, w: i32, ht: i32, flags: u32) -> BOOL;
+    fn GetDC(h: HWND) -> HDC;
+    fn ReleaseDC(h: HWND, dc: HDC) -> i32;
+    fn BeginPaint(h: HWND, ps: *mut PAINTSTRUCT) -> HDC;
+    fn EndPaint(h: HWND, ps: *const PAINTSTRUCT) -> BOOL;
+    fn InvalidateRect(h: HWND, r: *const RECT, erase: BOOL) -> BOOL;
+    fn ValidateRect(h: HWND, r: *const RECT) -> BOOL;
+    fn SetWindowTextW(h: HWND, s: *const u16) -> BOOL;
+    fn SetCapture(h: HWND) -> HWND;
+    fn ReleaseCapture() -> BOOL;
+    fn ShowCursor(show: BOOL) -> i32;
+    fn SetCursor(c: HANDLE) -> HANDLE;
+    fn LoadCursorW(inst: HMODULE, name: usize) -> HANDLE;
+    fn GetKeyboardState(state: *mut u8) -> BOOL;
+    fn GetKeyboardLayout(thread: u32) -> HANDLE;
+    fn ToUnicodeEx(vk: u32, sc: u32, state: *const u8, buf: *mut u16, n: i32, flags: u32, hkl: HANDLE) -> i32;
+    fn MapVirtualKeyW(code: u32, map: u32) -> u32;
+    fn SystemParametersInfoW(action: u32, param: u32, ptr: *mut c_void, ini: u32) -> BOOL;
+    fn MonitorFromWindow(h: HWND, flags: u32) -> HMONITOR;
+    fn GetMonitorInfoW(m: HMONITOR, info: *mut MONITORINFO) -> BOOL;
+    fn EnumDisplaySettingsW(name: *const u16, mode: u32, dm: *mut DEVMODEW) -> BOOL;
+    fn CreateIconIndirect(info: *const ICONINFO) -> HICON;
+    fn DestroyIcon(i: HICON) -> BOOL;
+    fn ClientToScreen(h: HWND, p: *mut POINT) -> BOOL;
+    fn ScreenToClient(h: HWND, p: *mut POINT) -> BOOL;
+    fn GetCursorPos(p: *mut POINT) -> BOOL;
+    fn PostQuitMessage(code: i32);
+    fn SetTimer(h: HWND, id: usize, ms: u32, proc_: *const c_void) -> usize;
+    fn KillTimer(h: HWND, id: usize) -> BOOL;
     #[cfg(target_pointer_width = "64")]
-    pub fn GetWindowLongPtrW(h: HWND, index: i32) -> isize;
+    fn GetWindowLongPtrW(h: HWND, index: i32) -> isize;
     #[cfg(target_pointer_width = "64")]
-    pub fn SetWindowLongPtrW(h: HWND, index: i32, v: isize) -> isize;
+    fn SetWindowLongPtrW(h: HWND, index: i32, v: isize) -> isize;
     #[cfg(target_pointer_width = "32")]
-    pub fn GetWindowLongW(h: HWND, index: i32) -> i32;
+    fn GetWindowLongW(h: HWND, index: i32) -> i32;
     #[cfg(target_pointer_width = "32")]
-    pub fn SetWindowLongW(h: HWND, index: i32, v: i32) -> i32;
+    fn SetWindowLongW(h: HWND, index: i32, v: i32) -> i32;
+    }
+    "gdi32" => {
+    fn CreateDIBSection(dc: HDC, bmi: *const BITMAPINFO, usage: u32, bits: *mut *mut c_void, section: HANDLE, offset: u32) -> HBITMAP;
+    fn CreateCompatibleDC(dc: HDC) -> HDC;
+    fn CreateBitmap(w: i32, h: i32, planes: u32, bits_per_pixel: u32, bits: *const c_void) -> HBITMAP;
+    fn DeleteDC(dc: HDC) -> BOOL;
+    fn DeleteObject(o: HANDLE) -> BOOL;
+    fn SelectObject(dc: HDC, o: HANDLE) -> HANDLE;
+    fn BitBlt(dst: HDC, x: i32, y: i32, w: i32, h: i32, src: HDC, sx: i32, sy: i32, rop: u32) -> BOOL;
+    fn GdiFlush() -> BOOL;
+    fn GetDeviceCaps(dc: HDC, index: i32) -> i32;
+    }
 }
+
 
 /// One spelling for the window-style accessors on both widths: Win32 makes the
 /// 64-bit names macros over the 32-bit ones and only exports Ptr on 64-bit.
@@ -350,29 +458,34 @@ pub unsafe fn get_window_long(h: HWND, i: i32) -> isize { unsafe { GetWindowLong
 #[cfg(target_pointer_width = "32")]
 pub unsafe fn set_window_long(h: HWND, i: i32, v: isize) -> isize { unsafe { SetWindowLongW(h, i, v as i32) as isize } }
 
-#[link(name = "gdi32")]
-unsafe extern "system" {
-    pub fn CreateDIBSection(dc: HDC, bmi: *const BITMAPINFO, usage: u32, bits: *mut *mut c_void, section: HANDLE, offset: u32) -> HBITMAP;
-    pub fn CreateCompatibleDC(dc: HDC) -> HDC;
-    pub fn CreateBitmap(w: i32, h: i32, planes: u32, bits_per_pixel: u32, bits: *const c_void) -> HBITMAP;
-    pub fn DeleteDC(dc: HDC) -> BOOL;
-    pub fn DeleteObject(o: HANDLE) -> BOOL;
-    pub fn SelectObject(dc: HDC, o: HANDLE) -> HANDLE;
-    pub fn BitBlt(dst: HDC, x: i32, y: i32, w: i32, h: i32, src: HDC, sx: i32, sy: i32, rop: u32) -> BOOL;
-    pub fn GdiFlush() -> BOOL;
-    pub fn GetDeviceCaps(dc: HDC, index: i32) -> i32;
-}
 
 // ---- dynamically resolved: everything newer than the baseline ------------------
-pub type FnDwmGetCompositionTimingInfo = unsafe extern "system" fn(HWND, *mut DWM_TIMING_INFO) -> i32;
-pub type FnDwmFlush = unsafe extern "system" fn() -> i32;
-pub type FnDwmIsCompositionEnabled = unsafe extern "system" fn(*mut BOOL) -> i32;
-pub type FnD3DKMTOpenAdapterFromHdc = unsafe extern "system" fn(*mut D3DKMT_OPENADAPTERFROMHDC) -> i32;
-pub type FnD3DKMTWaitForVerticalBlankEvent = unsafe extern "system" fn(*const D3DKMT_WAITFORVERTICALBLANKEVENT) -> i32;
-pub type FnSetProcessDpiAwarenessContext = unsafe extern "system" fn(isize) -> BOOL;
-pub type FnSetProcessDpiAwareness = unsafe extern "system" fn(u32) -> i32;
-pub type FnSetProcessDPIAware = unsafe extern "system" fn() -> BOOL;
-pub type FnGetDpiForWindow = unsafe extern "system" fn(HWND) -> u32;
+/// Function-pointer types for the exports resolved with GetProcAddress rather than
+/// imported. These carry the same ABI caveat as everything else Win32: an
+/// `extern "system"` pointer in a cosmo build is SysV and calling Windows through
+/// it segfaults inside a system DLL with a perfectly valid address in hand.
+macro_rules! win_fn_types {
+    ($( $name:ident = fn($($ty:ty),* $(,)?) $(-> $ret:ty)?; )*) => {
+        $(
+            #[cfg(all(cosmo, target_arch = "x86_64"))]
+            pub type $name = unsafe extern "win64" fn($($ty),*) $(-> $ret)?;
+            #[cfg(not(all(cosmo, target_arch = "x86_64")))]
+            pub type $name = unsafe extern "system" fn($($ty),*) $(-> $ret)?;
+        )*
+    };
+}
+
+win_fn_types! {
+    FnDwmGetCompositionTimingInfo = fn(HWND, *mut DWM_TIMING_INFO) -> i32;
+    FnDwmFlush = fn() -> i32;
+    FnDwmIsCompositionEnabled = fn(*mut BOOL) -> i32;
+    FnD3DKMTOpenAdapterFromHdc = fn(*mut D3DKMT_OPENADAPTERFROMHDC) -> i32;
+    FnD3DKMTWaitForVerticalBlankEvent = fn(*const D3DKMT_WAITFORVERTICALBLANKEVENT) -> i32;
+    FnSetProcessDpiAwarenessContext = fn(isize) -> BOOL;
+    FnSetProcessDpiAwareness = fn(u32) -> i32;
+    FnSetProcessDPIAware = fn() -> BOOL;
+    FnGetDpiForWindow = fn(HWND) -> u32;
+}
 
 /// Resolved once at open(); a None member means "this Windows does not have it"
 /// and the caller takes its documented fallback. Never assume a member is present.
