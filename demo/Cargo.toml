@@ -4,7 +4,7 @@
 # dependents' lockfiles.
 #
 #    cargo run                      the demo, natively
-#    cargo build -F ape --release    -> target/cosmo/demo.com
+#    cargo build -F ape --release    -> target/cosmo/release/demo.com
 #
 # Its own workspace: softer_gui is the package one directory up, and this is a
 # consumer of it like any other.
@@ -32,11 +32,11 @@ bin = "demo"
 ape = ["dep:cosmo-build"]
 
 [build-dependencies]
-cosmo-build = { version = "4", optional = true }
+cosmo-build = { version = "5", optional = true }
 
 # The libc shim, scoped to cfg(cosmo), which cosmo-build sets.
 [target.'cfg(cosmo)'.dependencies]
-cosmo-compat = "4"
+cosmo-compat = "5"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(cosmo)'] }

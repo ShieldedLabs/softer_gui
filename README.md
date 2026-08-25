@@ -124,7 +124,7 @@ Nothing to check out and nothing to install:
 ```
 cd demo
 cargo build -F ape --release
-sh target/cosmo/demo.com          # x86-64 + arm64 in one file
+sh target/cosmo/release/demo.com          # x86-64 + arm64 in one file
 ```
 
 The library itself has no part in this. It takes no cosmo dependency, exposes
@@ -144,10 +144,10 @@ bin = "demo"                      # what the .com is built from
 ape = ["dep:cosmo-build"]
 
 [build-dependencies]
-cosmo-build = { version = "4", optional = true }
+cosmo-build = { version = "5", optional = true }
 
 [target.'cfg(cosmo)'.dependencies]
-cosmo-compat = "4"
+cosmo-compat = "5"
 ```
 
 ```rust

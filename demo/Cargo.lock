@@ -59,9 +59,9 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "cosmo-build"
-version = "4.0.0"
+version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25a1de2731c9f3cfd5050a1cd97b96a21df453af883fd4a117b97044ca6f482c"
+checksum = "4301efec9ef938e211c110eed0054e68df18648fc16cd2e00eaf70e037730594"
 dependencies = [
  "sha2",
  "ureq",
@@ -70,9 +70,9 @@ dependencies = [
 
 [[package]]
 name = "cosmo-compat"
-version = "4.0.0"
+version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7626775056fceffe5bffc6388a79d794ba4252710a32e9ce6d325430526dafe"
+checksum = "9c2e78adbc9f785a095916073652eb67a47738ab914f725d8fe91b477a33010f"
 
 [[package]]
 name = "cpufeatures"
