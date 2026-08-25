@@ -286,7 +286,31 @@ impl D3d {
             let mut ctx: *mut c_void = core::ptr::null_mut();
             let mut got_level: u32 = 0;
             let mut hr = -1;
-            for driver in [D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP] {
+            // Which driver to ask for, and this is not a preference: inside a
+            // cosmopolitan APE the hardware driver kills the process.
+            //
+            // Measured on Windows 11 with an NVIDIA GPU: from an APE,
+            // D3D11CreateDevice with D3D_DRIVER_TYPE_HARDWARE raises
+            // STATUS_BREAKPOINT and never returns, with the library loaded, the
+            // entry point resolved and the ABI correct. The same call with
+            // D3D_DRIVER_TYPE_WARP succeeds and runs the whole flip-model path.
+            // So it is the vendor user-mode driver's initialisation that objects
+            // to something about a cosmo process, not D3D11 and not cosmo's
+            // loader. Native builds are unaffected and use hardware as usual.
+            //
+            // The ordinary hardware-then-WARP fallback cannot save us here,
+            // because the failure is a crash rather than an error return and
+            // there is nothing to fall back FROM. An APE therefore never asks
+            // for the hardware driver at all. SOFTER_GUI_D3D_DRIVER=hardware
+            // overrides that for anyone wanting to retest it on other hardware.
+            let want_drv = std::env::var("SOFTER_GUI_D3D_DRIVER").unwrap_or_default();
+            let drivers: &[u32] = match want_drv.as_str() {
+                "warp" => &[D3D_DRIVER_TYPE_WARP],
+                "hardware" => &[D3D_DRIVER_TYPE_HARDWARE],
+                _ if cfg!(cosmo) => &[D3D_DRIVER_TYPE_WARP],
+                _ => &[D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP],
+            };
+            for &driver in drivers {
                 hr = create(core::ptr::null_mut(), driver, NULL, 0,
                             FEATURE_LEVELS.as_ptr(), FEATURE_LEVELS.len() as u32,
                             D3D11_SDK_VERSION, &mut device, &mut got_level, &mut ctx);

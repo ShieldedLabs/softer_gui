@@ -89,6 +89,8 @@ whole of a modal resize drag. Same polling API on every platform.
 
 * X11: verified on Xorg 60.0010 Hz — contiguous msc, one present per vblank,
   resize/regrow, text (layout groups, shift, repeat), XI2 scroll, buttons, cursor hide.
+* Windows, as an APE: the capable presenter through WARP, 360 of 360 intervals
+  at exactly one period, drift -0.0 ms over 6 s.
 * Windows: two presenters, verified on Windows 11 at 60.000 Hz,
   `x86_64-pc-windows-msvc`. The capable one (D3D11 flip model, 8.1+) held 481 of
   481 intervals at exactly one period with +1.7 ms drift over 8 s; the compatible
@@ -249,10 +251,23 @@ version, but `DwmGetCompositionTimingInfo` (Vista and up) hands out an exact
 refresh rational and `cRefresh`. See the headers of `src/win.rs` and
 `src/win_d3d.rs` for the rest, including the fallbacks and known limitations.
 
-A cosmopolitan APE defaults to the compatible presenter. D3D11 brings its own
-threads, thread-local storage and COM apartments into a process whose libc was
-swapped underneath it, and measured here it takes an int3 inside `d3d11.dll`
-before returning a device. Portability keeps the presenter that is portable.
+A cosmopolitan APE gets the capable presenter too, but asks for WARP rather than
+the vendor driver. From an APE, `D3D11CreateDevice` with
+`D3D_DRIVER_TYPE_HARDWARE` raises STATUS_BREAKPOINT and never returns, with the
+library loaded, the entry point resolved and the ABI correct; the same call with
+`D3D_DRIVER_TYPE_WARP` succeeds and runs the whole flip-model path. So it is the
+vendor user-mode driver's initialisation that objects to something about a cosmo
+process, not D3D11 and not cosmo's loader, and native builds are unaffected.
+
+The ordinary hardware-then-WARP fallback cannot help, because the failure is a
+crash and not an error return, so an APE never asks for hardware at all.
+`SOFTER_GUI_D3D_DRIVER=hardware` retests it on other GPUs; measured here on
+NVIDIA.
+
+It costs nothing worth having. The GPU work in this crate is one copy per frame,
+not a scene, so a software rasteriser is not doing less of anything: measured on
+the APE, 360 of 360 intervals at exactly one period, drift **-0.0 ms** over 6 s,
+which is the best of any configuration here, native included.
 
 ### How far down it actually runs
 

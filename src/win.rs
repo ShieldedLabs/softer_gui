@@ -962,13 +962,11 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
         // answer. SOFTER_GUI_WIN=gdi forces the compatible path, which is how the
         // Vista-era code stays testable on a machine that is not Vista.
         let want = std::env::var("SOFTER_GUI_WIN").unwrap_or_default();
-        // A cosmo APE opts OUT of the capable path by default. D3D11 brings its own
-        // threads, thread-local storage and COM apartments into a process whose libc
-        // was swapped underneath it, and measured here it takes an int3 inside
-        // d3d11.dll before it ever returns a device. The compatible path needs none
-        // of that and is verified on the APE, so portability keeps the presenter
-        // that is actually portable. SOFTER_GUI_WIN=d3d still asks for it.
-        let try_d3d = if cfg!(cosmo) { want == "d3d" } else { want != "gdi" };
+        // Both builds try the capable path. An APE gets it through WARP rather
+        // than the vendor driver, for the reason set out in win_d3d.rs; that is a
+        // driver problem, not a D3D11 or cosmo one, and WARP measures as well
+        // there as hardware does natively.
+        let try_d3d = want != "gdi";
         let present = if !try_d3d { Present::Gdi } else {
             match D3d::new(hwnd, dbg) {
                 Some(d) => Present::D3d(d),

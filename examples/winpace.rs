@@ -13,13 +13,13 @@
 //! Run it with no argument for the honest case, or `winpace 10` to stall every
 //! tenth frame.
 
-#[cfg(not(target_os = "windows"))]
-fn main() { println!("winpace: Windows only"); }
+#[cfg(not(any(target_os = "windows", cosmo)))]
+fn main() { println!("winpace: Windows or a cosmo APE only"); }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", cosmo))]
 use softer_gui::*;
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", cosmo))]
 fn main() {
     let stall_every: u64 = std::env::args().nth(1).and_then(|a| a.parse().ok()).unwrap_or(10);
     let seconds: f64 = std::env::args().nth(2).and_then(|a| a.parse().ok()).unwrap_or(6.0);
