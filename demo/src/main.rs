@@ -130,6 +130,10 @@ fn app(mut gui: Gui) {
                 EVENT_BUTTONS => {
                     if ev.button(KEY_ESC) { break 'outer; }
                     if ev.button(KEY_F11) && !buttons.button(KEY_F11) { let f = !gui.is_fullscreen(); gui.set_fullscreen(f); }
+                    // F9 cycles how the pixels reach the screen, without touching
+                    // what is drawn. The frame-time HUD and the pacing line below
+                    // are the readout, so the paths can be compared on one picture.
+                    if ev.button(KEY_F9) && !buttons.button(KEY_F9) { gui.cycle_backend(); }
                     if ev.button(KEY_BACKSPACE) && !buttons.button(KEY_BACKSPACE) { typed.pop(); }
                     if ev.button(BTN_LEFT) != buttons.button(BTN_LEFT) { gui.set_cursor_hidden(ev.button(BTN_LEFT)); println!("left button {} at {},{}", ev.button(BTN_LEFT), mx, my); }
                     buttons = ev;

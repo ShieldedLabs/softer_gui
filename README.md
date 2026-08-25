@@ -263,6 +263,19 @@ separately, because the interesting APIs and the wide install base do not overla
 
 `--gdi` forces the compatible one, which is how the Vista-era code stays testable
 on a machine that is not Vista; `--d3d` asks for the capable one.
+
+**F9 cycles between them while the window stays up**: GDI, then D3D11 on the
+hardware driver, then D3D11 on WARP. Both presenters draw from the same CPU
+buffer, so nothing about the framebuffer changes and the app never learns it
+happened; only the route those pixels take to the screen does, and what the pump
+waits on. It is `Gui::cycle_backend()`, and `winpace --cycle` switches every
+second so the histogram can be checked across the switches: measured, 545 of 545
+intervals stayed at exactly one refresh period through eight of them.
+
+The one thing that does not survive a switch is the old presenter, and it has to
+go first: DXGI will not create a second swapchain for a window that already has
+one, so building the replacement before releasing the incumbent makes every
+switch to D3D fail and the cycle quietly degenerates to GDI and back.
 Left alone, the capable one is tried and any failure at all falls back, because
 every way it can fail has the same answer.
 

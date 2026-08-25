@@ -55,6 +55,11 @@ fn main() {
     println!("winpace: period {period} fs ({:.4} Hz), stalling every {stall_every} frames for {seconds}s",
              1e15 / period as f64);
 
+    // --cycle switches rendering path every second, which is how the switch
+    // itself gets tested: the histogram below must stay clean across them.
+    let cycle = std::env::args().any(|a| a == "--cycle");
+    let mut last_cycle = std::time::Instant::now();
+
     let mut ev = Event::default();
     let mut reported_size = (0u32, 0u32);
     let mut frames = 0u64;
@@ -78,6 +83,10 @@ fn main() {
                     }
                     last_t = ev.t_fs;
                     frames += 1;
+                    if cycle && last_cycle.elapsed().as_millis() > 1000 {
+                        last_cycle = std::time::Instant::now();
+                        gui.cycle_backend();
+                    }
                     let mut fb = gui.get_framebuffer();
                     if !fb.ok() { continue; }
                     let c = if frames % 2 == 0 { 0xFF203040 } else { 0xFF304020 };

@@ -324,8 +324,11 @@ struct Pump {
     /// anyway so a future one cannot deadlock the message loop.
     present: core::cell::RefCell<Present>,
     /// What run() sleeps on: the swapchain's waitable object on the capable path,
-    /// the vblank thread's event on the compatible one.
-    wait_handle: HANDLE,
+    /// the vblank thread's event on the compatible one. A Cell because cycling
+    /// presenters changes it, and run() therefore re-reads it every pass.
+    wait_handle: Cell<HANDLE>,
+    /// Which driver the live D3D presenter asked for, so the cycle knows where it is.
+    cur_driver: Cell<D3dDriver>,
     buttons: Cell<u32>,
     last_refresh: Cell<u64>,
     last_tick_ns: Cell<u64>,
@@ -621,6 +624,54 @@ impl Pump {
         }
     }
 
+    /// GDI -> D3D11 on the hardware driver -> D3D11 on WARP -> GDI.
+    ///
+    /// Both presenters draw from the same CPU buffer, so nothing about the
+    /// framebuffer changes here and the app never learns this happened; only the
+    /// way those pixels reach the screen does, and what the pump waits on. An APE
+    /// skips the hardware step, where asking for it kills the process.
+    fn cycle_presenter(&self) {
+        let Ok(mut pres) = self.present.try_borrow_mut() else { return };
+        let next: &[(bool, D3dDriver)] = if cfg!(cosmo) {
+            &[(false, D3dDriver::Auto), (true, D3dDriver::Warp)]
+        } else {
+            &[(false, D3dDriver::Auto), (true, D3dDriver::Hardware), (true, D3dDriver::Warp)]
+        };
+        let cur = match &*pres {
+            Present::Gdi => 0,
+            Present::D3d(_) => next.iter().position(|(d, drv)| *d && *drv == self.cur_driver.get()).unwrap_or(0),
+        };
+        // Release the live presenter before building its replacement. DXGI will
+        // not create a second swapchain for a window that already has one, so
+        // holding the old one alive makes every switch to D3D fail and the cycle
+        // degenerates into GDI and back.
+        *pres = Present::Gdi;
+        self.wait_handle.set(self.sh.vblank_ev.load(Relaxed) as HANDLE);
+        self.cur_driver.set(D3dDriver::Auto);
+
+        // Try each following entry in turn, so a presenter that will not start is
+        // skipped rather than leaving the window with nothing to draw with.
+        for step in 1..=next.len() {
+            let (want_d3d, drv) = next[(cur + step) % next.len()];
+            if !want_d3d {
+                if self.debug { eprintln!("softer_gui: presenter -> gdi"); }
+                break;
+            }
+            if let Some(d) = D3d::new(self.hwnd.get(), self.debug, drv) {
+                self.wait_handle.set(d.waitable);
+                *pres = Present::D3d(d);
+                self.cur_driver.set(drv);
+                if self.debug { eprintln!("softer_gui: presenter -> d3d11 {drv:?}"); }
+                break;
+            }
+            if self.debug { eprintln!("softer_gui: presenter d3d11 {drv:?} unavailable, skipping"); }
+        }
+        // The new path has never drawn this window, so it owes a whole frame.
+        self.core.full_redraw.store(true, Relaxed);
+        self.sh.dirty.store(true, Release);
+        unsafe { PostMessageW(self.hwnd.get(), WM_SOFTER_BLIT, 0, 0) };
+    }
+
     // ---- the frame boundary -----------------------------------------------------
     /// One refresh passed. This is the only place display time moves.
     ///
@@ -851,7 +902,7 @@ impl Pump {
 
     fn run(&self) {
         PUMP.with(|c| c.set(self as *const Pump));
-        let vblank = self.wait_handle;
+        // Re-read inside the loop: cycling presenters swaps it.
         loop {
             if self.core.quit.load(Relaxed) { break; }
             self.core.service_resync();
@@ -863,6 +914,7 @@ impl Pump {
                 if self.core.quit.load(Relaxed) { break; }
             }
             if self.core.quit.load(Relaxed) { break; }
+            if self.core.wants_cycle.swap(false, AcqRel) { self.cycle_presenter(); }
             self.apply_cursor();
             self.apply_fullscreen();
             self.apply_icon();
@@ -877,6 +929,7 @@ impl Pump {
             // is not optional: without it a message that arrives between the drain
             // above and this wait is marked already-seen and we sleep through it,
             // which shows up as a window that occasionally stops responding.
+            let vblank = self.wait_handle.get();
             let r = unsafe { MsgWaitForMultipleObjectsEx(1, &vblank, ms as u32, QS_ALLINPUT, MWMO_INPUTAVAILABLE) };
             if r == WAIT_OBJECT_0 {
                 // The waitable fires meaning "render now and you will make the
@@ -1006,6 +1059,9 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32,
             }
         };
         let use_d3d = matches!(present, Present::D3d(_));
+        let first_driver = if opts.d3d_driver == D3dDriver::Auto && !cfg!(cosmo) { D3dDriver::Hardware }
+                           else if opts.d3d_driver == D3dDriver::Auto { D3dDriver::Warp }
+                           else { opts.d3d_driver };
         // The capable path waits on the swapchain itself, so it needs no vblank
         // thread; the compatible one does. This is the one structural difference
         // between them beyond the pixels.
@@ -1018,7 +1074,8 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32,
             sh: sh2.clone(), core: core2, hwnd: Cell::new(hwnd), dyn_: d.clone(),
             cursor,
             present: core::cell::RefCell::new(present),
-            wait_handle,
+            wait_handle: Cell::new(wait_handle),
+            cur_driver: Cell::new(if use_d3d { first_driver } else { D3dDriver::Auto }),
             buttons: Cell::new(0), last_refresh: Cell::new(0), last_tick_ns: Cell::new(0),
             wake_qpc: Cell::new(0), hop_n: Cell::new(0), hop_sum: Cell::new(0), hop_max: Cell::new(0), have_refresh: Cell::new(false),
             in_size_move: Cell::new(false), cursor_hidden: Cell::new(false), fs_applied: Cell::new(false),
@@ -1032,15 +1089,17 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32,
         unsafe { ShowWindow(hwnd, SW_SHOW); UpdateWindow(hwnd); }
         pump.update_size();
 
-        let vb = if use_d3d {
-            if dbg { eprintln!("softer_gui: presenter d3d11 flip-model, waitable object, period {} fs ({:.3} Hz)", period, FS as f64 / period as f64); }
-            None
-        } else {
-            let mode = choose_vsync(&d);
-            if dbg { eprintln!("softer_gui: presenter gdi, vsync {:?}, period {} fs ({:.3} Hz)", mode, period, FS as f64 / period as f64); }
-            let shv = sh2.clone();
-            std::thread::Builder::new().name("softer_gui-win-vblank".into()).spawn(move || vblank_thread(shv, mode)).ok()
-        };
+        // Always started, even when D3D is presenting and nothing is waiting on
+        // its event: cycling to GDI later needs it, and a thread asleep on
+        // DwmFlush costs nothing. Its event is auto-reset, so an unconsumed
+        // signal just latches.
+        let mode = choose_vsync(&d);
+        if dbg {
+            let which = if use_d3d { "d3d11 flip-model, waitable object" } else { "gdi" };
+            eprintln!("softer_gui: presenter {which}, vsync {:?}, period {} fs ({:.3} Hz)", mode, period, FS as f64 / period as f64);
+        }
+        let shv = sh2.clone();
+        let vb = std::thread::Builder::new().name("softer_gui-win-vblank".into()).spawn(move || vblank_thread(shv, mode)).ok();
 
         *sh2.ready.lock().unwrap() = 1;
         sh2.ready_cv.notify_all();

@@ -43,6 +43,7 @@ pub const KEY_INSERT: u32 = 110;
 pub const KEY_DELETE: u32 = 111;
 pub const KEY_LEFTMETA: u32 = 125;
 pub const KEY_RIGHTMETA: u32 = 126;
+pub const KEY_F9: u32 = 67;
 pub const KEY_F11: u32 = 87;
 pub const KEY_F12: u32 = 88;
 pub const KEY_UNKNOWN: u32 = 240;
@@ -182,6 +183,10 @@ pub struct Core {
     /// Trace the backend's own decisions. Set once at open from Options, and read
     /// by every backend, so a caller can turn it on without an environment.
     pub debug: AtomicBool,
+    /// The app asking for the next rendering path. Windows only, where there is
+    /// more than one; a request the pump acts on, like the fullscreen flag,
+    /// because only the pump may touch the presenter.
+    pub wants_cycle: AtomicBool,
     /// Presents submitted but not yet completed by the display server.
     pub in_flight: AtomicU32,
     /// Bumped by the pump to poke the app-side wait (resize, etc.).
@@ -238,6 +243,7 @@ impl Core {
             quit: AtomicBool::new(false),
             focused: AtomicBool::new(true),
             debug: AtomicBool::new(false),
+            wants_cycle: AtomicBool::new(false),
             in_flight: AtomicU32::new(0),
             title_changed: AtomicBool::new(false),
             icon: std::sync::Mutex::new(Vec::new()),

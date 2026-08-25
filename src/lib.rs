@@ -285,6 +285,11 @@ impl Gui {
     /// Ask for a RENDER even though nothing was submitted last frame (animation wake-up).
     pub fn request_frame(&mut self) { self.core.wants_frame.store(true, Relaxed); self.poke(); }
     pub fn set_cursor_hidden(&mut self, hidden: bool) { self.core.cursor_hidden.store(hidden, Relaxed); self.poke(); }
+    /// Switch to the next rendering path and keep the window. Windows has more
+    /// than one (GDI, D3D11 on the hardware driver, D3D11 on WARP) and they differ
+    /// in latency, so being able to change without restarting is how you compare
+    /// them on the same picture. A no-op everywhere else.
+    pub fn cycle_backend(&mut self) { self.core.wants_cycle.store(true, Relaxed); self.poke(); }
     pub fn set_fullscreen(&mut self, on: bool) { self.core.wants_fullscreen.store(on, Relaxed); self.poke(); }
     pub fn is_fullscreen(&self) -> bool { self.core.wants_fullscreen.load(Relaxed) }
     pub fn window_size(&self) -> (u32, u32) { (self.core.win_w.load(Relaxed), self.core.win_h.load(Relaxed)) }
