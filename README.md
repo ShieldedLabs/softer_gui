@@ -91,6 +91,9 @@ whole of a modal resize drag. Same polling API on every platform.
   resize/regrow, text (layout groups, shift, repeat), XI2 scroll, buttons, cursor hide.
 * Windows, as an APE: the capable presenter through WARP, 360 of 360 intervals
   at exactly one period, drift -0.0 ms over 6 s.
+* Windows, switching presenters live: F9 cycles GDI, D3D11 hardware and D3D11
+  WARP with the window up, 545 of 545 intervals at exactly one period across
+  eight switches.
 * Windows: two presenters, verified on Windows 11 at 60.000 Hz,
   `x86_64-pc-windows-msvc`. The capable one (D3D11 flip model, 8.1+) held 481 of
   481 intervals at exactly one period with +1.7 ms drift over 8 s; the compatible
@@ -365,16 +368,26 @@ the same thing F11 does, so the difference is measurable:
 
 | | windowed | fullscreen |
 |---|---|---|
-| native, hardware driver | 32.55 ms | **9.6 ms** |
+| native, hardware driver | 32.55 ms | 9.6 ms *or* ~26 ms, see below |
 | native, WARP | 32.74 ms | 25.7 ms |
 | APE, WARP | 32.65 ms | 28.1 ms |
 
-Fullscreen on the hardware driver is worth **23 ms**, better than three times,
-and lands under a single refresh period (best sample 3.3 ms). WARP gets a
-smaller share of it, around 5 to 7 ms, which fits what WARP is: it rasterises
-into system memory, so something still has to move the result somewhere the
-display controller can scan out, and that is the part independent flip would
-otherwise have removed. An APE is inside 2 ms of native WARP either way.
+That fullscreen figure is the good case, and it is **not reliable**. Three
+identical runs measured 26.0 ms, 9.55 ms and 26.8 ms: independent flip is DWM's
+decision, not the program's, and it is granted only when nothing else needs
+compositing over the window. When it is granted the frame goes almost straight
+out, best sample 3.3 ms; when it is not, fullscreen is worth about 6 ms rather
+than 23. Expect the good case on an otherwise idle desktop and neither expect nor
+promise it in general.
+
+There is a tell, if you are measuring: the granted case reports statistics about
+five times more often, a few hundred samples in six seconds against a hundred or
+so, because presents are completing per frame rather than in batches.
+
+WARP gets a smaller share of fullscreen either way, which fits what WARP is: it
+rasterises into system memory, so something still has to move the result
+somewhere the display controller can scan out, and that is the part independent
+flip would otherwise have removed. An APE is inside 2 ms of native WARP.
 
 So the order of the levers is: go fullscreen, and use a hardware driver if you
 can. An APE cannot (see above), which puts its floor at WARP's.

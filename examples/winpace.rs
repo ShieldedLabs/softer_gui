@@ -83,7 +83,7 @@ fn main() {
                     }
                     last_t = ev.t_fs;
                     frames += 1;
-                    if cycle && last_cycle.elapsed().as_millis() > 1000 {
+                    if cycle && last_cycle.elapsed().as_millis() > 3000 {
                         last_cycle = std::time::Instant::now();
                         gui.cycle_backend();
                     }
