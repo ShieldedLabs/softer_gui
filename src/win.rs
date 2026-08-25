@@ -74,6 +74,7 @@ use crate::keysym;
 use crate::scancode_win::to_evdev;
 use crate::sys_win::*;
 use crate::win_d3d::D3d;
+use crate::{Backend_, D3dDriver, Options};
 
 const FS: u64 = 1_000_000_000_000_000;
 
@@ -85,8 +86,6 @@ const RESIZE_TIMER: usize = 1;
 const RESIZE_TIMER_MS: u32 = 8;
 
 fn now_ns() -> u64 { (qpc() as u128 * 1_000_000_000u128 / qpf() as u128) as u64 }
-
-fn debug() -> bool { std::env::var("SOFTER_GUI_DEBUG").is_ok() }
 
 // ---- the one CPU buffer -------------------------------------------------------
 /// A square power-of-two DIB section plus the memory DC it is selected into.
@@ -915,7 +914,7 @@ unsafe fn wndproc_impl(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
 }
 
 // ---- open ------------------------------------------------------------------------
-pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32) -> Option<App> {
+pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32, opts: Options) -> Option<App> {
     let _ = app_id;                 // Windows has no WM_CLASS analog worth setting here
     set_dpi_aware();
     let d = Arc::new(Dyn::load());
@@ -943,8 +942,9 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
     let title = title.to_string();
     let sh2 = sh.clone();
     let core2 = core.clone();
+    let core2b = core.clone();
     std::thread::Builder::new().name("softer_gui-win-pump".into()).spawn(move || {
-        let dbg = debug();
+        let dbg = opts.debug;
         let ok = unsafe {
             let inst = GetModuleHandleW(core::ptr::null());
             let class = wide("softer_gui_window");
@@ -990,17 +990,17 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
         // will not make a flip-model swapchain, a remote session) has the same
         // answer. SOFTER_GUI_WIN=gdi forces the compatible path, which is how the
         // Vista-era code stays testable on a machine that is not Vista.
-        let want = std::env::var("SOFTER_GUI_WIN").unwrap_or_default();
+        let want = opts.backend;
         // Both builds try the capable path. An APE gets it through WARP rather
         // than the vendor driver, for the reason set out in win_d3d.rs; that is a
         // driver problem, not a D3D11 or cosmo one, and WARP measures as well
         // there as hardware does natively.
-        let try_d3d = want != "gdi";
+        let try_d3d = want != Backend_::Gdi;
         let present = if !try_d3d { Present::Gdi } else {
-            match D3d::new(hwnd, dbg) {
+            match D3d::new(hwnd, dbg, opts.d3d_driver) {
                 Some(d) => Present::D3d(d),
                 None => {
-                    if want == "d3d" { eprintln!("softer_gui: d3d requested but unavailable; using GDI"); }
+                    if want == Backend_::D3d { eprintln!("softer_gui: d3d requested but unavailable; using GDI"); }
                     Present::Gdi
                 }
             }
@@ -1026,6 +1026,7 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
             icon_big: Cell::new(0), icon_small: Cell::new(0),
             debug: dbg,
         };
+        if opts.fullscreen { core2b.wants_fullscreen.store(true, Relaxed); }
         pump.refresh_repeat();
         pump.update_scale();
         unsafe { ShowWindow(hwnd, SW_SHOW); UpdateWindow(hwnd); }

@@ -48,6 +48,7 @@
 use core::ffi::c_void;
 use crate::sys_win::*;
 use crate::sys_win::win_fn_types;
+use crate::D3dDriver;
 
 /// One unused vtable entry. Pointer-sized, so it holds the slot without needing a
 /// signature we would only get wrong.
@@ -278,7 +279,7 @@ unsafe impl Send for D3d {}
 impl D3d {
     /// Try to stand up the capable path. Returns None on anything at all, because
     /// every failure here has the same answer: use the GDI path instead.
-    pub fn new(hwnd: HWND, debug: bool) -> Option<D3d> {
+    pub fn new(hwnd: HWND, debug: bool, driver: D3dDriver) -> Option<D3d> {
         unsafe {
             let d3d11 = LoadLibraryW(wide("d3d11.dll").as_ptr());
             if d3d11.is_null() { return None; }
@@ -309,12 +310,11 @@ impl D3d {
             // there is nothing to fall back FROM. An APE therefore never asks
             // for the hardware driver at all. SOFTER_GUI_D3D_DRIVER=hardware
             // overrides that for anyone wanting to retest it on other hardware.
-            let want_drv = std::env::var("SOFTER_GUI_D3D_DRIVER").unwrap_or_default();
-            let drivers: &[u32] = match want_drv.as_str() {
-                "warp" => &[D3D_DRIVER_TYPE_WARP],
-                "hardware" => &[D3D_DRIVER_TYPE_HARDWARE],
-                _ if cfg!(cosmo) => &[D3D_DRIVER_TYPE_WARP],
-                _ => &[D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP],
+            let drivers: &[u32] = match driver {
+                D3dDriver::Warp => &[D3D_DRIVER_TYPE_WARP],
+                D3dDriver::Hardware => &[D3D_DRIVER_TYPE_HARDWARE],
+                D3dDriver::Auto if cfg!(cosmo) => &[D3D_DRIVER_TYPE_WARP],
+                D3dDriver::Auto => &[D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP],
             };
             for &driver in drivers {
                 hr = create(core::ptr::null_mut(), driver, NULL, 0,

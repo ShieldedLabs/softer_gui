@@ -226,7 +226,16 @@ across a foreign thread:
 profile here sets both to values that break threads under cosmo. Native builds
 keep the profile as written.
 
-`SOFTER_GUI_X11=1` forces X11; `SOFTER_GUI_DEBUG=1` logs pump events.
+Every program here takes the same flags: `--debug` traces what the backend chose
+and how it is pacing, `--fullscreen` starts borderless fullscreen, `--x11`,
+`--gdi` and `--d3d` pick a backend, `--warp` and `--hardware` pick a D3D11 device.
+
+They are flags rather than environment variables, which needed one thing from the
+library: it cannot read a command line. Reading the program's own argv is not a
+library's business, so `open_with(title, app_id, w, h, Options)` takes the
+choices and the program decides where they come from. Plain `open()` still uses
+`Options::from_env()`, which honours the old `SOFTER_GUI_*` variables, because a
+program with no flags to offer still needs some way to be told.
 `examples/xtest.rs` drives a window with XTEST for headless testing;
 `examples/wintest.rs` and `examples/winpace.rs` are the Windows equivalents and
 drive themselves.
@@ -252,8 +261,8 @@ separately, because the interesting APIs and the wide install base do not overla
 | threads | pump + vblank + app | pump + app |
 | `Core::in_flight` | inert | real, from `PresentCount` |
 
-`SOFTER_GUI_WIN=gdi` forces the compatible one (which is how the Vista-era code
-stays testable on a machine that is not Vista); `=d3d` asks for the capable one.
+`--gdi` forces the compatible one, which is how the Vista-era code stays testable
+on a machine that is not Vista; `--d3d` asks for the capable one.
 Left alone, the capable one is tried and any failure at all falls back, because
 every way it can fail has the same answer.
 
@@ -301,8 +310,7 @@ process, not D3D11 and not cosmo's loader, and native builds are unaffected.
 
 The ordinary hardware-then-WARP fallback cannot help, because the failure is a
 crash and not an error return, so an APE never asks for hardware at all.
-`SOFTER_GUI_D3D_DRIVER=hardware` retests it on other GPUs; measured here on
-NVIDIA.
+`--hardware` retests it on other GPUs; measured here on NVIDIA.
 
 It costs nothing worth having, and that is measured rather than assumed. The GPU
 work in this crate is one copy per frame, not a scene, so a software rasteriser
@@ -328,8 +336,8 @@ frame of allowed latency looks like.
 Two caveats. One early hardware run measured 17.6 ms, a single period, and never
 reproduced; do not read it as a hardware advantage. And this is submit to
 scanout, not input to photons, which also includes the frame the app spends
-drawing. `SOFTER_GUI_DEBUG=1` prints it, so the same question can be asked on
-AMD and Intel.
+drawing. `--debug` prints it, so the same question can be asked on AMD and
+Intel.
 
 ### Getting the latency down
 
@@ -339,8 +347,8 @@ scans out at the FOLLOWING vblank; that second frame is the compositor, not this
 crate. Cover the screen and DWM can hand the swapchain straight to the display
 controller instead (independent flip), and the frame disappears.
 
-`SOFTER_GUI_FULLSCREEN=1` makes the demo and `winpace` start borderless
-fullscreen, which is the same thing F11 does, so the difference is measurable:
+`--fullscreen` makes the demo and `winpace` start borderless fullscreen, which is
+the same thing F11 does, so the difference is measurable:
 
 | | windowed | fullscreen |
 |---|---|---|

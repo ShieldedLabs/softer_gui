@@ -179,6 +179,9 @@ pub struct Core {
     pub wants_frame: AtomicBool,
     pub quit: AtomicBool,
     pub focused: AtomicBool,
+    /// Trace the backend's own decisions. Set once at open from Options, and read
+    /// by every backend, so a caller can turn it on without an environment.
+    pub debug: AtomicBool,
     /// Presents submitted but not yet completed by the display server.
     pub in_flight: AtomicU32,
     /// Bumped by the pump to poke the app-side wait (resize, etc.).
@@ -234,6 +237,7 @@ impl Core {
             wants_frame: AtomicBool::new(false),
             quit: AtomicBool::new(false),
             focused: AtomicBool::new(true),
+            debug: AtomicBool::new(false),
             in_flight: AtomicU32::new(0),
             title_changed: AtomicBool::new(false),
             icon: std::sync::Mutex::new(Vec::new()),

@@ -77,6 +77,77 @@ use std::sync::atomic::Ordering::*;
 /// Smallest power of two ≥ n (and ≥ 256): the square framebuffer's side.
 pub fn next_pow2(n: u32) -> u32 { let mut s = 256u32; while s < n { s <<= 1; } s }
 
+/// Which backend to use, when more than one could serve.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Backend_ {
+    /// Pick the best one that works here. Nearly always what you want.
+    #[default]
+    Auto,
+    /// Linux: force X11 rather than trying Wayland first.
+    X11,
+    /// Windows: the compatible presenter, GDI on a Vista-era API baseline.
+    Gdi,
+    /// Windows: the capable presenter, D3D11 flip model, Windows 8.1 and up.
+    D3d,
+}
+
+/// Which D3D11 device to ask for. Windows only, and only for `Backend_::D3d`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum D3dDriver {
+    /// Hardware natively; WARP inside an APE, where the vendor driver crashes.
+    #[default]
+    Auto,
+    Hardware,
+    /// Microsoft's software rasteriser. Costs ~0.2 ms of latency here, because
+    /// the GPU work in this crate is one copy per frame rather than a scene.
+    Warp,
+}
+
+/// How to open the window.
+///
+/// These were environment variables, and for a library that is the conventional
+/// place: a library has no command line of its own, and reading the program's
+/// argv would collide with whatever the program wants to do with it. So the
+/// knobs live here, the application decides where they come from, and the ones
+/// shipped in this repo parse them from their own flags.
+///
+/// `Options::from_env()` keeps the old variables working for a program that has
+/// no flags to offer, and is what plain `open()` uses.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Options {
+    /// Trace what the backend chose and how it is pacing.
+    pub debug: bool,
+    /// Start borderless fullscreen. On Windows this is worth most of a frame of
+    /// latency, because it lets the compositor hand the swapchain straight to
+    /// the display controller instead of compositing it.
+    pub fullscreen: bool,
+    pub backend: Backend_,
+    pub d3d_driver: D3dDriver,
+}
+
+impl Options {
+    /// The environment variables this crate used to read, and still honours for
+    /// callers that reach `open()` without options of their own.
+    pub fn from_env() -> Options {
+        let var = |n: &str| std::env::var(n).unwrap_or_default();
+        Options {
+            debug: std::env::var("SOFTER_GUI_DEBUG").is_ok(),
+            fullscreen: std::env::var("SOFTER_GUI_FULLSCREEN").is_ok(),
+            backend: match (var("SOFTER_GUI_X11").as_str(), var("SOFTER_GUI_WIN").as_str()) {
+                ("1", _) => Backend_::X11,
+                (_, "gdi") => Backend_::Gdi,
+                (_, "d3d") => Backend_::D3d,
+                _ => Backend_::Auto,
+            },
+            d3d_driver: match var("SOFTER_GUI_D3D_DRIVER").as_str() {
+                "hardware" => D3dDriver::Hardware,
+                "warp" => D3dDriver::Warp,
+                _ => D3dDriver::Auto,
+            },
+        }
+    }
+}
+
 enum Backend {
     #[cfg(target_os = "linux")]
     X11(x11::App),
@@ -116,7 +187,14 @@ impl Framebuffer {
 /// is not known until the program starts, so the backend is picked here rather
 /// than by the compiler.
 pub fn open(title: &str, app_id: &str, width: u32, height: u32) -> Option<Gui> {
+    open_with(title, app_id, width, height, Options::from_env())
+}
+
+/// `open`, with the choices made explicitly rather than read from the
+/// environment. This is what a program with its own command line should call.
+pub fn open_with(title: &str, app_id: &str, width: u32, height: u32, opts: Options) -> Option<Gui> {
     let core = Arc::new(Core::new());
+    core.debug.store(opts.debug, Relaxed);
     // An APE carries every backend and picks one here, from what cosmo says the
     // host actually is. A native build has exactly one and the branch is gone at
     // compile time.
@@ -127,12 +205,12 @@ pub fn open(title: &str, app_id: &str, width: u32, height: u32) -> Option<Gui> {
     }
     #[cfg(cosmo)]
     if sys_win::cosmo::is_windows() {
-        let app = win::open(core.clone(), title, app_id, width, height)?;
+        let app = win::open(core.clone(), title, app_id, width, height, opts)?;
         return Some(Gui { core, back: Backend::Win(app) });
     }
     #[cfg(any(target_os = "linux", cosmo))]
     {
-        let force_x11 = std::env::var("SOFTER_GUI_X11").map(|v| v == "1").unwrap_or(false);
+        let force_x11 = opts.backend == Backend_::X11;
         if !force_x11 {
             if let Some(app) = wayland::open(core.clone(), title, app_id, width, height) {
                 return Some(Gui { core, back: Backend::Wayland(app) });
@@ -148,7 +226,7 @@ pub fn open(title: &str, app_id: &str, width: u32, height: u32) -> Option<Gui> {
     }
     #[cfg(all(target_os = "windows", not(cosmo)))]
     {
-        let app = win::open(core.clone(), title, app_id, width, height)?;
+        let app = win::open(core.clone(), title, app_id, width, height, opts)?;
         Some(Gui { core, back: Backend::Win(app) })
     }
 }

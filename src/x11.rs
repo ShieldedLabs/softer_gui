@@ -656,7 +656,7 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
         if let Some(rep) = r.wait_reply(s) {
             // xkbGetControlsReply: ...internalModsVmods@16, ignoreLockModsVmods@18, repeatDelay@20, repeatInterval@22.
             let delay = rd16(&rep, 20) as u64; let interval = rd16(&rep, 22) as u64;
-            if std::env::var("SOFTER_GUI_DEBUG").is_ok() { eprintln!("softer_gui: xkb repeat delay {delay} ms interval {interval} ms"); }
+            if core.debug.load(Relaxed) { eprintln!("softer_gui: xkb repeat delay {delay} ms interval {interval} ms"); }
             if interval > 0 { repeat = Some((delay, interval)); }
         }
         // XkbSelectEvents: NewKeyboardNotify (all details) + MapNotify (all map parts).
@@ -742,7 +742,7 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
         conn.req(xi, 46, &b);
     }
     conn.req(MAP_WINDOW, 0, &u32b(win));
-    if std::env::var("SOFTER_GUI_DEBUG").is_ok() { eprintln!("softer_gui: x11 window 0x{win:x}"); }
+    if core.debug.load(Relaxed) { eprintln!("softer_gui: x11 window 0x{win:x}"); }
     // PresentSelectInput(eid, window, ConfigureNotify|CompleteNotify|IdleNotify)
     let eid = conn.new_id();
     { let mut b = Vec::new(); b.extend_from_slice(&u32b(eid)); b.extend_from_slice(&u32b(win)); b.extend_from_slice(&u32b(1 | 2 | 4)); conn.req(present, 3, &b); }
@@ -755,13 +755,13 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
         conn, win, ext, sync_counter,
         sync_want: AtomicU64::new(0), sync_done: AtomicU64::new(0), sync_size: AtomicU64::new(0), sync_ack_serial: AtomicU32::new(0),
         pixmap: [AtomicU32::new(0), AtomicU32::new(0)], present_serial: AtomicU32::new(1),
-        debug: std::env::var("SOFTER_GUI_DEBUG").is_ok(),
+        debug: core.debug.load(Relaxed),
     });
     let mut pump = Pump {
         sh: sh.clone(), core: core.clone(), r, atoms, keymap: xkb::Keymap::default(),
         last_msc: 0, first_complete: true, win_root_x: 0, win_root_y: 0, crtc_rect: (0, 0, 0, 0),
         cursor_applied: false, fs_applied: false, scroll: Vec::new(), pinch_scale: 1 << 16, quit_seen: false,
-        debug: std::env::var("SOFTER_GUI_DEBUG").is_ok(),
+        debug: core.debug.load(Relaxed),
         render_hold_until: 0,
     };
     pump.load_keymap();

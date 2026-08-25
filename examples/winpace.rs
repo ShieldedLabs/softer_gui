@@ -19,24 +19,41 @@ fn main() { println!("winpace: Windows or a cosmo APE only"); }
 #[cfg(any(target_os = "windows", cosmo))]
 use softer_gui::*;
 
+/// The flags every program in this repo understands, so the same words work
+/// whichever one you are running. A library cannot read these for you: it has no
+/// command line, and helping itself to the program's argv is not its business.
+fn options_from_args() -> softer_gui::Options {
+    use softer_gui::{Backend_, D3dDriver};
+    let mut o = softer_gui::Options::default();
+    for a in std::env::args().skip(1) {
+        match a.as_str() {
+            "--debug" => o.debug = true,
+            "--fullscreen" => o.fullscreen = true,
+            "--gdi" => o.backend = Backend_::Gdi,
+            "--d3d" => o.backend = Backend_::D3d,
+            "--x11" => o.backend = Backend_::X11,
+            "--warp" => o.d3d_driver = D3dDriver::Warp,
+            "--hardware" => o.d3d_driver = D3dDriver::Hardware,
+            _ => {}
+        }
+    }
+    o
+}
+
 #[cfg(any(target_os = "windows", cosmo))]
 fn main() {
-    let stall_every: u64 = std::env::args().nth(1).and_then(|a| a.parse().ok()).unwrap_or(10);
-    let seconds: f64 = std::env::args().nth(2).and_then(|a| a.parse().ok()).unwrap_or(6.0);
+    // Positionals are whatever is not a flag, so the two can be given in any order.
+    let nums: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with("--")).collect();
+    let stall_every: u64 = nums.first().and_then(|a| a.parse().ok()).unwrap_or(10);
+    let seconds: f64 = nums.get(1).and_then(|a| a.parse().ok()).unwrap_or(6.0);
 
-    let Some(mut gui) = softer_gui::open("softer_gui winpace", "lol.softer.winpace", 480, 320) else {
+    let Some(mut gui) = softer_gui::open_with("softer_gui winpace", "lol.softer.winpace", 480, 320, options_from_args()) else {
         eprintln!("winpace: could not open a window");
         std::process::exit(1);
     };
     let period = gui.period_fs();
     println!("winpace: period {period} fs ({:.4} Hz), stalling every {stall_every} frames for {seconds}s",
              1e15 / period as f64);
-
-    // SOFTER_GUI_FULLSCREEN=1 asks for borderless fullscreen, which is what
-    // lets DWM hand the swapchain straight to the display controller (independent
-    // flip) instead of compositing it. That is worth a whole frame of latency, so
-    // the difference is worth being able to measure.
-    if std::env::var("SOFTER_GUI_FULLSCREEN").is_ok() { gui.set_fullscreen(true); }
 
     let mut ev = Event::default();
     let mut reported_size = (0u32, 0u32);

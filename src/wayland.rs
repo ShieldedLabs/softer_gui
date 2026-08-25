@@ -818,7 +818,7 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
         ptr_surf: 0, ptr_x: 0, ptr_y: 0, ptr_enter_serial: 0, ptr_serial: 0, cursor_shape: 0, cursor_surf: 0, cursor_mem: None, frame_mem: None,
         axis_v: 0, axis_h: 0, axis_v120: None, axis_h120: None, axis_dirty: false, pinch_scale: 1 << 16,
         last_seq: 0, first_present: true,
-        debug: std::env::var("SOFTER_GUI_DEBUG").is_ok(),
+        debug: core.debug.load(Relaxed),
         cursor_applied: false, fs_applied: false, sync_done: None,
     };
     // wl_display.get_registry, one round-trip for the globals, a second for what binding them triggers

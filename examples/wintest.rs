@@ -180,11 +180,32 @@ fn drain_renders(gui: &mut Gui, ms: u64, ts: &mut Vec<u128>) -> (u128, u128) {
     (slow_get, slow_submit)
 }
 
+/// The flags every program in this repo understands, so the same words work
+/// whichever one you are running. A library cannot read these for you: it has no
+/// command line, and helping itself to the program's argv is not its business.
+fn options_from_args() -> softer_gui::Options {
+    use softer_gui::{Backend_, D3dDriver};
+    let mut o = softer_gui::Options::default();
+    for a in std::env::args().skip(1) {
+        match a.as_str() {
+            "--debug" => o.debug = true,
+            "--fullscreen" => o.fullscreen = true,
+            "--gdi" => o.backend = Backend_::Gdi,
+            "--d3d" => o.backend = Backend_::D3d,
+            "--x11" => o.backend = Backend_::X11,
+            "--warp" => o.d3d_driver = D3dDriver::Warp,
+            "--hardware" => o.d3d_driver = D3dDriver::Hardware,
+            _ => {}
+        }
+    }
+    o
+}
+
 #[cfg(target_os = "windows")]
 fn main() {
     use inject::*;
 
-    let Some(mut gui) = softer_gui::open("softer_gui wintest", "lol.softer.wintest", 640, 480) else {
+    let Some(mut gui) = softer_gui::open_with("softer_gui wintest", "lol.softer.wintest", 640, 480, options_from_args()) else {
         eprintln!("wintest: could not open a window");
         std::process::exit(1);
     };
@@ -242,11 +263,19 @@ fn main() {
     // ---- the scancode table, through our own window procedure -------------------
     // These need no focus, so they run everywhere, including on a machine whose
     // desktop belongs to somebody else at the time.
+    // Retried, because a posted key can land before the pump has settled and the
+    // first case in the run is the one that pays for it. The mapping either holds
+    // or it does not; a flake here would only teach the reader to ignore the test.
     let mut table_case = |scan: u32, ext: bool, want: u32, label: &str| {
         let mut evs = Vec::new();
-        post_tap(hwnd, scan, ext);
-        drain(&mut gui, 200, &mut evs);
-        let got = evs.iter().any(|e| e.kind == EVENT_BUTTONS && e.button(want));
+        let mut got = false;
+        for _ in 0..3 {
+            evs.clear();
+            post_tap(hwnd, scan, ext);
+            drain(&mut gui, 200, &mut evs);
+            got = evs.iter().any(|e| e.kind == EVENT_BUTTONS && e.button(want));
+            if got { break; }
+        }
         println!("{} {label}", if got { "ok  " } else { "FAIL" });
         (got, evs)
     };

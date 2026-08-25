@@ -48,6 +48,27 @@ fn make_icon(side: u32) -> softer_gui::icon::OwnedIcon {
     ic
 }
 
+/// The flags every program in this repo understands, so the same words work
+/// whichever one you are running. A library cannot read these for you: it has no
+/// command line, and helping itself to the program's argv is not its business.
+fn options_from_args() -> softer_gui::Options {
+    use softer_gui::{Backend_, D3dDriver};
+    let mut o = softer_gui::Options::default();
+    for a in std::env::args().skip(1) {
+        match a.as_str() {
+            "--debug" => o.debug = true,
+            "--fullscreen" => o.fullscreen = true,
+            "--gdi" => o.backend = Backend_::Gdi,
+            "--d3d" => o.backend = Backend_::D3d,
+            "--x11" => o.backend = Backend_::X11,
+            "--warp" => o.d3d_driver = D3dDriver::Warp,
+            "--hardware" => o.d3d_driver = D3dDriver::Hardware,
+            _ => {}
+        }
+    }
+    o
+}
+
 fn main() {
     let icons: Vec<softer_gui::icon::OwnedIcon> = [16u32, 24, 32, 48, 64, 128, 256].iter().map(|s| make_icon(*s)).collect();
 
@@ -68,7 +89,7 @@ fn main() {
         return;
     }
 
-    let Some(mut gui) = softer_gui::open("softer_gui demo", APP_ID, 640, 480) else {
+    let Some(mut gui) = softer_gui::open_with("softer_gui demo", APP_ID, 640, 480, options_from_args()) else {
         eprintln!("could not open a window");
         return;
     };
@@ -81,11 +102,6 @@ fn main() {
 }
 
 fn app(mut gui: Gui) {
-    // Same thing F11 does, but reachable without a keyboard. Fullscreen is what
-    // lets DWM hand the swapchain to the display controller instead of
-    // compositing it, which is worth most of a frame of latency on Windows, so
-    // it has to be measurable from a script.
-    if std::env::var("SOFTER_GUI_FULLSCREEN").is_ok() { gui.set_fullscreen(true); }
     let period = gui.period_fs();
     println!("demo: window {}x{}, period {} fs ({:.4} Hz)", gui.window_size().0, gui.window_size().1, period, 1e15 / period as f64);
 
