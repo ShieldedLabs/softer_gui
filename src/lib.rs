@@ -43,7 +43,7 @@ pub mod sys;
 #[cfg(cosmo)]
 #[path = "sys_cosmo.rs"]
 pub mod sys;
-#[cfg(feature = "cosmo")]
+#[cfg(cosmo)]
 extern crate cosmo_compat as _;
 #[cfg(target_os = "linux")]
 mod shm;

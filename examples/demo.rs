@@ -5,7 +5,7 @@
 // The libc shims have to be referenced from the crate that is *linked*: pulling
 // them in from the library alone leaves the rlib ahead of std in the link order,
 // where nothing is undefined yet and the archive members are dropped.
-#[cfg(feature = "cosmo")]
+#[cfg(cosmo)]
 extern crate cosmo_compat as _;
 
 use softer_gui::*;

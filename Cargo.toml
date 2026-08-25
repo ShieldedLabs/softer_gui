@@ -4,13 +4,25 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 
-[dependencies]
-# Only for `cargo cosmo` builds (a libc shim, not a dependency in the crates.io sense):
-# std's strerror_r contract vs cosmo's. Enabled by the `cosmo` feature.
-cosmo-compat = { path = "../cargo_cosmo/crates/cosmo-compat", optional = true }
+# What `cargo build -F ape` builds into the .com. This crate is a library, so
+# the APE needs a program named for it; cargo ignores everything under
+# package.metadata, so a native build never sees this.
+[package.metadata.cosmo]
+example = "demo"
 
+# `cargo build -F ape` fuses an x86-64 and an arm64 build into one .com file.
+# With the feature off, none of this is fetched, compiled or run.
 [features]
-cosmo = ["dep:cosmo-compat"]
+ape = ["dep:cosmo-build"]
+
+[build-dependencies]
+cosmo-build = { version = "3", optional = true }
+
+# The libc shim: std's strerror_r contract vs cosmo's, plus the constant
+# translation. Scoped to cfg(cosmo), which cosmo-build sets, so a native build
+# never resolves it and no feature flag has to be remembered.
+[target.'cfg(cosmo)'.dependencies]
+cosmo-compat = "3"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(cosmo)'] }

@@ -117,26 +117,33 @@ whole of a modal resize drag. Same polling API on every platform.
 
 ## One universal binary (Cosmopolitan APE)
 
-With [cargo_cosmo](https://github.com/ShieldedLabs/cargo_cosmo) checked out next
-to this repo:
+Nothing to check out and nothing to install:
 
 ```
-PATH=../cargo_cosmo/tools:../cargo_cosmo/toolchain/cosmocc/bin:$PATH \
-CARGO_COSMO_TOOLCHAIN=nightly-2026-08-23 \
-  cargo cosmo build --release --features cosmo --example demo
+cargo build -F ape --release
 sh target/cosmo/demo.com          # x86-64 + arm64 in one file
 ```
 
-(`CARGO_COSMO_TOOLCHAIN` is how the driver is told to ignore this repo's stable
-pin, which applies to native builds only.)
+The `ape` feature pulls in [`cosmo-build`](https://crates.io/crates/cosmo-build),
+which runs the build once per architecture and fuses the two with `apelink`. It
+installs the nightly it needs (this repo's stable pin applies to native builds
+only) and downloads cosmopolitan's toolchain into a cache shared across
+projects, so the first APE build is slow and the rest are not. With the feature
+off none of that is fetched, compiled or run, and `cargo build` is the ordinary
+static musl build it always was.
 
-Under `cfg(cosmo)` (set by the driver) `src/sys_cosmo.rs` replaces the raw
-syscalls with calls into cosmo's libc, so cosmo picks syscall numbers, struct
-layouts and constants at load time for whatever host the file lands on; the
-X11/Wayland wire code is unchanged. Verified on Linux/X11 at the same 60.0010 Hz
-as the native build. The `cosmo` feature pulls in cargo_cosmo's `cosmo-compat`
-libc shim; this needs cargo_cosmo's pinned nightly (custom target specs), the
-stable pin here applies to native builds only.
+This crate is a library, so the APE needs a program named for it:
+`[package.metadata.cosmo]` in `Cargo.toml` points at `examples/demo.rs`. Cargo
+ignores everything under `package.metadata`, so a native build never sees it.
+
+Under `cfg(cosmo)`, which `cosmo-build` sets, `src/sys_cosmo.rs` replaces the
+raw syscalls with calls into cosmo's libc, so cosmo picks syscall numbers,
+struct layouts and constants at load time for whatever host the file lands on;
+the X11/Wayland wire code is unchanged. The same `cfg` pulls in the
+[`cosmo-compat`](https://crates.io/crates/cosmo-compat) libc shim, which is not
+optional -- it reconciles std's `strerror_r` contract with cosmo's and
+translates the OS constants rustc baked in. Verified on Linux/X11 at the same
+60.0010 Hz as the native build, 0 dropped vblanks.
 
 **That same file runs on Windows**, verified on Windows 11: 720 frames,
 0 dropped vblanks, 0 duplicate timestamps, 60.000 Hz, −16.7 ms drift held flat
