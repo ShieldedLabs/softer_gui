@@ -130,6 +130,17 @@ cargo build -F ape --release
 sh target/cosmo/release/demo.com          # x86-64 + arm64 in one file
 ```
 
+That is a Linux command, and it has to be: the APE is linked by a shell script,
+so Windows answers `%1 is not a valid Win32 application (os error 193)` and the
+build cannot run there. From Windows, `build-ape.cmd` at the repo root is the
+whole thing in one command, driving the build in WSL; `wsl.exe` inherits and
+translates the working directory, so there is nothing to configure. The result
+runs on Windows as it is.
+
+Under WSL, run the `.com` through `cosmocc/bin/ape-$(uname -m).elf` rather than
+by path: binfmt claims PE images there, so a bare APE starts as a *Windows*
+process and a "Linux" test silently measures the wrong OS.
+
 The library itself has no part in this. It takes no cosmo dependency, exposes
 no `ape` feature and has no build script, so a crate that depends on
 `softer_gui` sees none of it -- nothing in its lockfile, nothing to compile.
