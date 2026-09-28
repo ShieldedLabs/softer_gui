@@ -193,7 +193,19 @@ impl Drop for App {
 // Pump thread
 // ============================================================================
 
-struct ScrollDev { id: u16, v_num: u16, h_num: u16, v_inc: f64, h_inc: f64, v_last: Option<f64>, h_last: Option<f64> }
+/// One XI2 device with a ScrollClass. `touch` decides which axis its smooth deltas
+/// feed: a touch surface pans in pixels (AXIS_SCROLL), anything else is a wheel and
+/// its deltas are fractions of `*_inc`, one detent each (AXIS_WHEEL). XI2 has no
+/// "is a touchpad" bit, so it is inferred from an XITouchClass on the device or a
+/// touchpad-ish device name, which covers synaptics, libinput and the Apple/ELAN/
+/// ALPS naming that reaches X through them.
+struct ScrollDev { id: u16, touch: bool, v_num: u16, h_num: u16, v_inc: f64, h_inc: f64, v_last: Option<f64>, h_last: Option<f64> }
+
+fn touchpad_name(name: &[u8]) -> bool {
+    let lower: Vec<u8> = name.iter().map(|c| c.to_ascii_lowercase()).collect();
+    [&b"touchpad"[..], b"trackpad", b"clickpad", b"glidepoint", b"synaptics", b"touch pad"]
+        .iter().any(|needle| lower.windows(needle.len()).any(|w| w == *needle))
+}
 
 struct Pump {
     sh: Arc<Shared>,
@@ -291,11 +303,14 @@ impl Pump {
         for _ in 0..n {
             if o + 12 > rep.len() { break; }
             let id = rd16(&rep, o); let nclasses = rd16(&rep, o + 6) as usize; let name_len = rd16(&rep, o + 8) as usize;
+            let name_end = (o + 12 + name_len).min(rep.len());
+            let touch_by_name = touchpad_name(&rep[(o + 12).min(name_end)..name_end]);
             o += 12 + ((name_len + 3) & !3);
-            let mut dev = ScrollDev { id, v_num: u16::MAX, h_num: u16::MAX, v_inc: 0.0, h_inc: 0.0, v_last: None, h_last: None };
+            let mut dev = ScrollDev { id, touch: touch_by_name, v_num: u16::MAX, h_num: u16::MAX, v_inc: 0.0, h_inc: 0.0, v_last: None, h_last: None };
             for _ in 0..nclasses {
                 if o + 4 > rep.len() { break; }
                 let ty = rd16(&rep, o); let len = rd16(&rep, o + 2) as usize * 4;
+                if ty == 8 { dev.touch = true; }   // XITouchClass: a touch surface
                 if ty == 3 && o + 24 <= rep.len() {   // ScrollClass
                     let number = rd16(&rep, o + 6); let stype = rd16(&rep, o + 8);
                     let inc = rd32(&rep, o + 16) as i32 as f64 + rd32(&rep, o + 20) as f64 / 4294967296.0;
@@ -394,8 +409,8 @@ impl Pump {
                 let b = p[1] as u32;
                 let code = match b { 1 => BTN_LEFT, 2 => BTN_MIDDLE, 3 => BTN_RIGHT, 8 => BTN_SIDE, 9 => BTN_EXTRA, _ => 0 };
                 if ty == 4 && (4..=7).contains(&b) {
-                    let d = match b { 4 => -SCROLL_STEP, 5 => SCROLL_STEP, 6 => -SCROLL_STEP, _ => SCROLL_STEP };
-                    let axis = if b <= 5 { AXIS_SCROLL_V } else { AXIS_SCROLL_H };
+                    let d = match b { 4 | 6 => -WHEEL_CLICK, _ => WHEEL_CLICK };
+                    let axis = if b <= 5 { AXIS_WHEEL_V } else { AXIS_WHEEL_H };
                     self.core.push_axes(&[AxisDiff { axis, delta: d }]);
                 }
                 if code != 0 { self.core.key(code, ty == 4); }
@@ -530,12 +545,22 @@ impl Pump {
                         let v = rd32(p, o) as i32 as f64 + rd32(p, o + 4) as f64 / 4294967296.0;
                         o += 8;
                         if let Some(d) = self.scroll.iter_mut().find(|d| d.id == sourceid) {
-                            if bit as u16 == d.v_num {
-                                if let Some(last) = d.v_last { let px = (v - last) / d.v_inc * 15.0; diffs.push(AxisDiff { axis: AXIS_SCROLL_V, delta: (px * 256.0) as i32 }); }
-                                d.v_last = Some(v);
+                            // The valuator counts `inc` per wheel detent. A wheel reports that
+                            // as clicks; a touch surface's increment is a nominal 15 px per
+                            // "line", so its deltas become pixels at that rate.
+                            let (axis_num, inc, last, scroll_axis, wheel_axis) = if bit as u16 == d.v_num {
+                                (d.v_num, d.v_inc, &mut d.v_last, AXIS_SCROLL_V, AXIS_WHEEL_V)
                             } else if bit as u16 == d.h_num {
-                                if let Some(last) = d.h_last { let px = (v - last) / d.h_inc * 15.0; diffs.push(AxisDiff { axis: AXIS_SCROLL_H, delta: (px * 256.0) as i32 }); }
-                                d.h_last = Some(v);
+                                (d.h_num, d.h_inc, &mut d.h_last, AXIS_SCROLL_H, AXIS_WHEEL_H)
+                            } else { (u16::MAX, 0.0, &mut d.v_last, 0, 0) };
+                            if axis_num != u16::MAX {
+                                if let Some(prev) = *last {
+                                    let detents = (v - prev) / inc;
+                                    let diff = if d.touch { AxisDiff { axis: scroll_axis, delta: (detents * SCROLL_STEP as f64) as i32 } }
+                                               else { AxisDiff { axis: wheel_axis, delta: (detents * WHEEL_CLICK as f64) as i32 } };
+                                    if diff.delta != 0 { diffs.push(diff); }
+                                }
+                                *last = Some(v);
                             }
                         }
                     }
@@ -548,8 +573,8 @@ impl Pump {
                             // A wheel on a device without a ScrollClass: legacy buttons, one click each.
                             let known = self.scroll.iter().any(|d| d.id == sourceid);
                             if !known {
-                                let d = match b { 4 | 6 => -SCROLL_STEP, _ => SCROLL_STEP };
-                                self.core.push_axes(&[AxisDiff { axis: if b <= 5 { AXIS_SCROLL_V } else { AXIS_SCROLL_H }, delta: d }]);
+                                let d = match b { 4 | 6 => -WHEEL_CLICK, _ => WHEEL_CLICK };
+                                self.core.push_axes(&[AxisDiff { axis: if b <= 5 { AXIS_WHEEL_V } else { AXIS_WHEEL_H }, delta: d }]);
                             }
                         }
                     }

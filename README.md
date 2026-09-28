@@ -28,7 +28,7 @@ loop {
             }
             EVENT_BUTTONS => { if ev.button(KEY_ESC) { return; } }   // absolute 512-bit snapshot, evdev codes
             EVENT_TEXT => { for c in ev.text() { /* layout-aware codepoints */ } }
-            EVENT_AXES => { for a in ev.axes() { /* MOUSE_X/Y abs 24.8, SCROLL_V/H 24.8 px, ZOOM/ROTATE 16.16 */ } }
+            EVENT_AXES => { for a in ev.axes() { /* MOUSE_X/Y abs 24.8, SCROLL_V/H touchpad 24.8 px, WHEEL_V/H mouse 24.8 clicks, ZOOM/ROTATE 16.16 */ } }
             EVENT_CLOSE => return,
             _ => {}
         }
@@ -67,8 +67,16 @@ loop {
   (server repeat is suppressed).
 * **Pointer.** X11 uses XInput 2 (smooth scroll valuators, 2.4 pinch/rotate);
   Wayland uses wl_pointer axes/value120 and zwp_pointer_gestures; macOS
-  scrollingDelta/magnification/rotation; Windows uses WM_MOUSE* and emits no
-  ZOOM/ROTATE (there is no touchpad-gesture equivalent short of raw HID).
+  scrollingDelta/magnification/rotation; Windows uses WM_MOUSE* and
+  GetCurrentInputMessageSource, and turns a precision touchpad's Ctrl+wheel
+  pinch into ZOOM (there is no ROTATE short of raw HID).
+* **Wheel vs touchpad.** Every backend decides which device a scroll came from
+  and reports a mouse wheel on AXIS_WHEEL_V/H in clicks and a touch surface on
+  AXIS_SCROLL_V/H in pixels, never both, so an application maps "wheel steps,
+  touchpad pans" once with no per-OS constants. The tell is
+  hasPreciseScrollingDeltas on macOS, axis_source/value120/axis_discrete on
+  Wayland, an XITouchClass or touchpad-ish device name on X11, and the input
+  message source (or a non-whole click delta before Windows 8) on Windows.
 
 ## Threads
 

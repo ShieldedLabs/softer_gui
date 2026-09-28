@@ -266,6 +266,7 @@ pub const VK_NUMLOCK: u32 = 0x90;
 pub const VK_F4: u32 = 0x73;
 
 pub const WHEEL_DELTA: i32 = 120;
+pub const MK_CONTROL: usize = 0x0008;
 
 pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
 pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE: isize = -3;
@@ -487,7 +488,15 @@ win_fn_types! {
     FnSetProcessDpiAwareness = fn(u32) -> i32;
     FnSetProcessDPIAware = fn() -> BOOL;
     FnGetDpiForWindow = fn(HWND) -> u32;
+    FnGetCurrentInputMessageSource = fn(*mut INPUT_MESSAGE_SOURCE) -> BOOL;
 }
+
+/// GetCurrentInputMessageSource's answer: which device the message being handled
+/// came from. Windows 8+. deviceType is one of the IMDT_* values.
+#[repr(C)]
+pub struct INPUT_MESSAGE_SOURCE { pub device_type: u32, pub origin_id: u32 }
+pub const IMDT_TOUCH: u32 = 0x02;
+pub const IMDT_TOUCHPAD: u32 = 0x08;
 
 /// Resolved once at open(); a None member means "this Windows does not have it"
 /// and the caller takes its documented fallback. Never assume a member is present.
@@ -498,6 +507,7 @@ pub struct Dyn {
     pub kmt_open: Option<FnD3DKMTOpenAdapterFromHdc>,
     pub kmt_wait: Option<FnD3DKMTWaitForVerticalBlankEvent>,
     pub dpi_for_window: Option<FnGetDpiForWindow>,
+    pub msg_source: Option<FnGetCurrentInputMessageSource>,
 }
 
 pub fn wide(s: &str) -> Vec<u16> { s.encode_utf16().chain(core::iter::once(0)).collect() }
@@ -521,6 +531,7 @@ impl Dyn {
                 kmt_open: core::mem::transmute::<*const c_void, Option<FnD3DKMTOpenAdapterFromHdc>>(sym(gdi, b"D3DKMTOpenAdapterFromHdc\0")),
                 kmt_wait: core::mem::transmute::<*const c_void, Option<FnD3DKMTWaitForVerticalBlankEvent>>(sym(gdi, b"D3DKMTWaitForVerticalBlankEvent\0")),
                 dpi_for_window: core::mem::transmute::<*const c_void, Option<FnGetDpiForWindow>>(sym(user, b"GetDpiForWindow\0")),
+                msg_source: core::mem::transmute::<*const c_void, Option<FnGetCurrentInputMessageSource>>(sym(user, b"GetCurrentInputMessageSource\0")),
             }
         }
     }

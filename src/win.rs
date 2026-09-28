@@ -866,15 +866,38 @@ impl Pump {
             }
             WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
                 let delta = ((w >> 16) & 0xFFFF) as u16 as i16 as i32;
-                // 120 units is one click and one click is SCROLL_STEP, so the scale
-                // is exact and a high-resolution wheel's sub-click deltas convert
-                // without rounding or a leftover accumulator.
-                let v = delta * (SCROLL_STEP / WHEEL_DELTA);
                 // Ours is positive when the content moves up or left; Windows is
                 // positive when the wheel goes forward or the tilt goes right.
-                let axis = if msg == WM_MOUSEWHEEL { AXIS_SCROLL_V } else { AXIS_SCROLL_H };
-                let delta = if msg == WM_MOUSEWHEEL { -v } else { v };
-                self.core.push_axes(&[AxisDiff { axis, delta }]);
+                let delta = if msg == WM_MOUSEWHEEL { -delta } else { delta };
+                let vertical = msg == WM_MOUSEWHEEL;
+                // Windows folds a precision touchpad into the wheel message: a two-finger
+                // pan is a stream of small WM_MOUSEWHEELs and a pinch is the same with
+                // MK_CONTROL set. GetCurrentInputMessageSource (Win8+) names the device;
+                // before it, a delta that is not whole clicks is the best tell.
+                let touch = match self.dyn_.msg_source {
+                    Some(f) => {
+                        let mut src = INPUT_MESSAGE_SOURCE { device_type: 0, origin_id: 0 };
+                        let ok = unsafe { f(&mut src) } != 0;
+                        ok && (src.device_type == IMDT_TOUCHPAD || src.device_type == IMDT_TOUCH)
+                    }
+                    None => delta % WHEEL_DELTA != 0,
+                };
+                if touch && vertical && (w as usize & MK_CONTROL) != 0 {
+                    // A pinch. Windows hands it over as a zoom-ish wheel; the only scale it
+                    // gives is the wheel delta, so one click is treated as +-10 %, the
+                    // rate Explorer and the browsers zoom at.
+                    let dz = -(delta as i64) * 6554 / WHEEL_DELTA as i64;
+                    if dz != 0 { self.core.push_axes(&[AxisDiff { axis: AXIS_ZOOM, delta: dz as i32 }]); }
+                } else if touch {
+                    // A pan: WHEEL_DELTA per "line" at the conventional line height.
+                    let axis = if vertical { AXIS_SCROLL_V } else { AXIS_SCROLL_H };
+                    self.core.push_axes(&[AxisDiff { axis, delta: delta * (SCROLL_STEP / WHEEL_DELTA) }]);
+                } else {
+                    // 120 units is one click and one click is WHEEL_CLICK, so a
+                    // high-resolution wheel's sub-click deltas convert without rounding.
+                    let axis = if vertical { AXIS_WHEEL_V } else { AXIS_WHEEL_H };
+                    self.core.push_axes(&[AxisDiff { axis, delta: delta * WHEEL_CLICK / WHEEL_DELTA }]);
+                }
                 return 0;
             }
             WM_DPICHANGED => {

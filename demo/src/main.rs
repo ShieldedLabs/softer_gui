@@ -147,6 +147,8 @@ fn app(mut gui: Gui) {
                         AXIS_MOUSE_Y => my = d.delta as i64 >> 8,
                         AXIS_SCROLL_V => scroll_y += d.delta as i64,
                         AXIS_SCROLL_H => scroll_x += d.delta as i64,
+                        AXIS_WHEEL_V => scroll_y += d.delta as i64 * SCROLL_STEP as i64 / WHEEL_CLICK as i64,
+                        AXIS_WHEEL_H => scroll_x += d.delta as i64 * SCROLL_STEP as i64 / WHEEL_CLICK as i64,
                         AXIS_ZOOM => zoom *= 1.0 + d.delta as f64 / 65536.0,
                         AXIS_ROTATE => angle += d.delta as f64 / 65536.0,
                         _ => {}

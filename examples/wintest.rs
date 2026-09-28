@@ -254,11 +254,14 @@ fn main() {
     check("BTN_LEFT release clears it again", btn_up_after);
 
     // Ours is positive when the content moves up; Windows is positive when the
-    // wheel goes forward, so one forward click must arrive as -SCROLL_STEP.
-    let wheel_v = evs.iter().any(|e| e.kind == EVENT_AXES && e.axes().iter().any(|a| a.axis == AXIS_SCROLL_V && a.delta == -SCROLL_STEP));
-    check("wheel forward is one -SCROLL_STEP on AXIS_SCROLL_V", wheel_v);
-    let wheel_h = evs.iter().any(|e| e.kind == EVENT_AXES && e.axes().iter().any(|a| a.axis == AXIS_SCROLL_H && a.delta == SCROLL_STEP));
-    check("wheel tilt right is one +SCROLL_STEP on AXIS_SCROLL_H", wheel_h);
+    // wheel goes forward, so one forward click must arrive as -WHEEL_CLICK. A posted
+    // message has no input source, which is the mouse path, not the touchpad one.
+    let wheel_v = evs.iter().any(|e| e.kind == EVENT_AXES && e.axes().iter().any(|a| a.axis == AXIS_WHEEL_V && a.delta == -WHEEL_CLICK));
+    check("wheel forward is one -WHEEL_CLICK on AXIS_WHEEL_V", wheel_v);
+    let wheel_h = evs.iter().any(|e| e.kind == EVENT_AXES && e.axes().iter().any(|a| a.axis == AXIS_WHEEL_H && a.delta == WHEEL_CLICK));
+    check("wheel tilt right is one +WHEEL_CLICK on AXIS_WHEEL_H", wheel_h);
+    let no_scroll = !evs.iter().any(|e| e.kind == EVENT_AXES && e.axes().iter().any(|a| a.axis == AXIS_SCROLL_V || a.axis == AXIS_SCROLL_H));
+    check("a mouse wheel never lands on AXIS_SCROLL", no_scroll);
 
     // ---- the scancode table, through our own window procedure -------------------
     // These need no focus, so they run everywhere, including on a machine whose

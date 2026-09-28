@@ -77,6 +77,7 @@ enum Raw {
     KeyUp(u32),
     Button { code: u32, down: bool },
     Scroll { v: i32, h: i32 },
+    Wheel { v: i32, h: i32 },
     Zoom(i32),
     Rotate(i32),
     Focus(bool),
@@ -247,6 +248,7 @@ fn produce(sh: &Shared, link: *mut core::ffi::c_void, ticks: u32) {
             Raw::KeyUp(code) => core.key(code, false),
             Raw::Button { code, down } => core.key(code, down),
             Raw::Scroll { v, h } => { let mut d = Vec::new(); if v != 0 { d.push(AxisDiff { axis: AXIS_SCROLL_V, delta: v }); } if h != 0 { d.push(AxisDiff { axis: AXIS_SCROLL_H, delta: h }); } core.push_axes(&d); }
+            Raw::Wheel { v, h } => { let mut d = Vec::new(); if v != 0 { d.push(AxisDiff { axis: AXIS_WHEEL_V, delta: v }); } if h != 0 { d.push(AxisDiff { axis: AXIS_WHEEL_H, delta: h }); } core.push_axes(&d); }
             Raw::Zoom(z) => core.push_axes(&[AxisDiff { axis: AXIS_ZOOM, delta: z }]),
             Raw::Rotate(a) => core.push_axes(&[AxisDiff { axis: AXIS_ROTATE, delta: a }]),
             Raw::Focus(f) => { core.focused.store(f, Relaxed); if !f { core.release_all_keys(true); } }
@@ -378,12 +380,22 @@ impl Pump {
                     self.push(Raw::Button { code, down: matches!(ty, 1 | 3 | 25) });
                     send1(self.app, self.sel_send_event, ev);
                 }
-                22 => {   // ScrollWheel: precise deltas are pixels (points × scale), else lines × SCROLL_STEP
+                22 => {   // ScrollWheel
+                    // hasPreciseScrollingDeltas is AppKit's own device split: true for a
+                    // touch surface (trackpad, Magic Mouse), where the deltas are points and
+                    // become AXIS_SCROLL pixels; false for a wheel, where deltaY is already
+                    // in clicks (fractional under the system's wheel acceleration) and
+                    // becomes AXIS_WHEEL. The sign flip is because AppKit's positive is
+                    // "content moves down" and ours is the opposite; the natural-scrolling
+                    // preference has been applied by the time the event reaches us.
                     let dx = ret_f64(ev, self.sel_scroll_x); let dy = ret_f64(ev, self.sel_scroll_y);
                     let precise = ret_u64(ev, self.sel_precise) & 1 != 0;
-                    let scale = self.sh.scale.load(Relaxed).max(1) as f64;
-                    let (v, h) = if precise { (-dy * scale * 256.0, -dx * scale * 256.0) } else { (-dy * SCROLL_STEP as f64, -dx * SCROLL_STEP as f64) };
-                    self.push(Raw::Scroll { v: v as i32, h: h as i32 });
+                    if precise {
+                        let scale = self.sh.scale.load(Relaxed).max(1) as f64;
+                        self.push(Raw::Scroll { v: (-dy * scale * 256.0) as i32, h: (-dx * scale * 256.0) as i32 });
+                    } else {
+                        self.push(Raw::Wheel { v: (-dy * WHEEL_CLICK as f64) as i32, h: (-dx * WHEEL_CLICK as f64) as i32 });
+                    }
                     send1(self.app, self.sel_send_event, ev);
                 }
                 30 => { let m = ret_f64(ev, self.sel_magnification); self.push(Raw::Zoom((m * 65536.0) as i32)); send1(self.app, self.sel_send_event, ev); }

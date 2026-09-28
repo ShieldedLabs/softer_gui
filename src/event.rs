@@ -57,15 +57,30 @@ pub const BTN_EXTRA: u32 = 0x114;
 /// Absolute pointer position, 24.8 fixed pixels, window-local. (Also on every RENDER.)
 pub const AXIS_MOUSE_X: u32 = 0;
 pub const AXIS_MOUSE_Y: u32 = 1;
-/// Scroll, 24.8 fixed pixels; positive = content moves up/left (finger down / wheel down).
-/// One wheel click is SCROLL_STEP.
+/// Continuous scroll from a touch surface (touchpad, Magic Mouse, touch screen pan):
+/// 24.8 fixed physical pixels, already in the direction the OS's "natural scrolling"
+/// setting asks for. Positive = content moves up/left.
+///
+/// A mouse wheel never lands here: it is AXIS_WHEEL_V/H, in clicks, because the two
+/// devices mean different things to an application (a wheel is a stepper, a touchpad
+/// is a pan) and no OS agrees on how many pixels a click is worth. The split is done
+/// by the backend on every platform, so an application never has to guess the device
+/// from the shape of the numbers.
 pub const AXIS_SCROLL_V: u32 = 2;
 pub const AXIS_SCROLL_H: u32 = 3;
 /// Touchpad pinch: change of scale factor, 16.16 fixed (+6554 = +10 %).
 pub const AXIS_ZOOM: u32 = 4;
 /// Touchpad rotate: degrees, 16.16 fixed, clockwise positive.
 pub const AXIS_ROTATE: u32 = 5;
-/// One wheel click in SCROLL units (15 px in 24.8).
+/// Mouse wheel, 24.8 fixed *clicks*: one detent is WHEEL_CLICK (256), high-resolution
+/// wheels arrive in fractions of it. Positive = wheel rolled toward the user / tilted
+/// right, i.e. the same sense as AXIS_SCROLL. An application that wants the wheel to
+/// pan like a touchpad multiplies by SCROLL_STEP / WHEEL_CLICK.
+pub const AXIS_WHEEL_V: u32 = 6;
+pub const AXIS_WHEEL_H: u32 = 7;
+/// One wheel detent on AXIS_WHEEL_V/H.
+pub const WHEEL_CLICK: i32 = 256;
+/// Conventional pan distance for one wheel click, in AXIS_SCROLL units (15 px in 24.8).
 pub const SCROLL_STEP: i32 = 15 * 256;
 
 pub const MODE_DEAD_KEY: u8 = 1;

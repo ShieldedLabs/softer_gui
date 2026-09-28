@@ -227,6 +227,7 @@ struct Pump {
     ptr_surf: u32, ptr_x: i32, ptr_y: i32, ptr_enter_serial: u32, ptr_serial: u32, cursor_shape: u32,
     cursor_surf: u32, cursor_mem: Option<ShmMem>, frame_mem: Option<ShmMem>,
     axis_v: i32, axis_h: i32, axis_v120: Option<i32>, axis_h120: Option<i32>, axis_dirty: bool,
+    axis_vd: Option<i32>, axis_hd: Option<i32>, axis_source: u32,
     pinch_scale: i32,
     last_seq: u64, first_present: bool,
     debug: bool,
@@ -492,12 +493,29 @@ impl Pump {
         if !self.axis_dirty { return; }
         self.axis_dirty = false;
         let mut d = Vec::new();
-        // value120 (wheels, exact 1/120 clicks) wins over the continuous value when both arrived.
-        let v = match self.axis_v120 { Some(v) => v * SCROLL_STEP / 120, None => self.axis_v };
-        let h = match self.axis_h120 { Some(v) => v * SCROLL_STEP / 120, None => self.axis_h };
-        if v != 0 { d.push(AxisDiff { axis: AXIS_SCROLL_V, delta: v }); }
-        if h != 0 { d.push(AxisDiff { axis: AXIS_SCROLL_H, delta: h }); }
+        // A wheel is anything the compositor says is one: axis_value120 (seat v8+, exact
+        // 1/120 clicks), axis_discrete (v5-7, whole clicks), or axis_source wheel /
+        // wheel_tilt with only the continuous value, which libinput scales at 15 units
+        // per detent. Everything else (finger, continuous, or a compositor too old to
+        // say) is a pan in pixels.
+        const SOURCE_WHEEL: u32 = 0; const SOURCE_WHEEL_TILT: u32 = 3;
+        let by_source = self.axis_source == SOURCE_WHEEL || self.axis_source == SOURCE_WHEEL_TILT;
+        let mut one = |cont: i32, v120: Option<i32>, disc: Option<i32>, scroll_axis: u32, wheel_axis: u32| {
+            let clicks = match (v120, disc) {
+                (Some(v), _) => Some(v * WHEEL_CLICK / 120),
+                (None, Some(c)) => Some(c * WHEEL_CLICK),
+                (None, None) if by_source => Some(cont / 15),
+                _ => None,
+            };
+            match clicks {
+                Some(c) => { if c != 0 { d.push(AxisDiff { axis: wheel_axis, delta: c }); } }
+                None => { if cont != 0 { d.push(AxisDiff { axis: scroll_axis, delta: cont }); } }
+            }
+        };
+        one(self.axis_v, self.axis_v120, self.axis_vd, AXIS_SCROLL_V, AXIS_WHEEL_V);
+        one(self.axis_h, self.axis_h120, self.axis_hd, AXIS_SCROLL_H, AXIS_WHEEL_H);
         self.axis_v = 0; self.axis_h = 0; self.axis_v120 = None; self.axis_h120 = None;
+        self.axis_vd = None; self.axis_hd = None; self.axis_source = u32::MAX;
         if !d.is_empty() { self.core.push_axes(&d); }
     }
     fn frame_done(&mut self, frames: u64) {
@@ -721,12 +739,18 @@ impl Pump {
                     if self.seat_version < 5 { self.flush_axes(); }
                 }
                 5 => self.flush_axes(),   // frame
+                6 => { self.axis_source = a.u(); self.axis_dirty = true; }   // axis_source(source)
+                8 => {   // axis_discrete(axis, discrete clicks)
+                    let axis = a.u(); let v = a.i();
+                    if axis == 0 { self.axis_vd = Some(self.axis_vd.unwrap_or(0) + v); } else { self.axis_hd = Some(self.axis_hd.unwrap_or(0) + v); }
+                    self.axis_dirty = true;
+                }
                 9 => {   // axis_value120(axis, value120)
                     let axis = a.u(); let v = a.i();
                     if axis == 0 { self.axis_v120 = Some(self.axis_v120.unwrap_or(0) + v); } else { self.axis_h120 = Some(self.axis_h120.unwrap_or(0) + v); }
                     self.axis_dirty = true;
                 }
-                _ => {}   // axis_source, axis_stop, axis_discrete, axis_relative_direction
+                _ => {}   // axis_stop, axis_relative_direction
             }
             return;
         }
@@ -816,7 +840,7 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
         frame_w: 0, frame_h: 0, ml: 0, mr: 0, mt: 0, mb: 0, have_frame: false, ssd: false,
         keymap: xkb::Keymap::default(), mods: 0, group: 0,
         ptr_surf: 0, ptr_x: 0, ptr_y: 0, ptr_enter_serial: 0, ptr_serial: 0, cursor_shape: 0, cursor_surf: 0, cursor_mem: None, frame_mem: None,
-        axis_v: 0, axis_h: 0, axis_v120: None, axis_h120: None, axis_dirty: false, pinch_scale: 1 << 16,
+        axis_v: 0, axis_h: 0, axis_v120: None, axis_h120: None, axis_dirty: false, axis_vd: None, axis_hd: None, axis_source: u32::MAX, pinch_scale: 1 << 16,
         last_seq: 0, first_present: true,
         debug: core.debug.load(Relaxed),
         cursor_applied: false, fs_applied: false, sync_done: None,
