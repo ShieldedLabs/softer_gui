@@ -141,7 +141,7 @@ impl App {
         if self.core.busy[self.cur].load(Acquire) { return None; }
         let b = self.bufs[self.cur].as_ref()?;
         self.frame_w = w; self.frame_h = h;
-        Some((b.mem.ptr as *mut u32, self.side, (self.generation << 1) | self.cur as u64))
+        Some((b.mem.ptr as *mut u32, self.side, (self.generation << 2) | self.cur as u64))
     }
     pub fn submit(&mut self) {
         let sh = &self.sh;

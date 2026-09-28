@@ -105,8 +105,12 @@ pub struct App {
     side: u32,
     generation: u64,
     cur: usize,
-    surfaces: [Option<Surface>; 2],
+    surfaces: [Option<Surface>; BUFFERS],
+    locked: bool,
 }
+
+/// Three, not two: see get_framebuffer.
+const BUFFERS: usize = 3;
 
 impl App {
     fn ensure_size(&mut self) {
@@ -116,30 +120,44 @@ impl App {
             // Keep the old (still-bound) surfaces alive and on screen; the next submit flips
             // old->new in ONE transaction and frees them — detaching first was a grey flash.
             let mut pend = self.sh.pend_free.lock().unwrap();
-            for s in self.surfaces.iter_mut() { if let Some(s) = s.take() { if pend.is_empty() || pend.len() < 2 { pend.push(s); } else { unsafe { CFRelease(s.surf); } } } }
+            for s in self.surfaces.iter_mut() { if let Some(s) = s.take() { if pend.len() < BUFFERS { pend.push(s); } else { unsafe { CFRelease(s.surf); } } } }
             drop(pend);
             self.side = want;
             self.generation += 1;
             self.cur = 0;
-            self.surfaces[0] = make_surface(want);
-            self.surfaces[1] = make_surface(want);
+            for s in self.surfaces.iter_mut() { *s = make_surface(want); }
+            self.locked = false;
             self.core.full_redraw.store(true, Relaxed);
         }
     }
     pub fn get_framebuffer(&mut self) -> Option<(*mut u32, u32, u64)> {
         self.ensure_size();
-        // Double-buffered, no triple buffer: the buffer returned was shown two vblanks ago.
-        // IOSurfaceLock WAITS for the rare sub-ms release lag rather than tearing, so no
-        // racy IOSurfaceIsInUse pre-check (that dropped 6-18% of flips below 120 Hz).
+        // Triple-buffered, and the WindowServer's own use count is the gate. IOSurfaceLock
+        // serialises CPU access only; it does not wait for the compositor, which reads a
+        // surface until the commit that replaces it has been composited. With two
+        // surfaces the one handed back here was replaced one commit ago and was still
+        // being read 6-18% of the time at 120 Hz, and drawing into it then is a frame
+        // that shows half-drawn: visible flicker. With three, the surface handed back
+        // was replaced two commits ago and is free in practice; when it is not, this
+        // reports no buffer and the caller skips the frame rather than tearing it.
         let s = self.surfaces[self.cur].as_ref()?;
-        let mut seed = 0u32;
-        unsafe { IOSurfaceLock(s.surf, 0, &mut seed); }
-        Some((s.addr as *mut u32, self.side, (self.generation << 1) | self.cur as u64))
+        if !self.locked {
+            if unsafe { IOSurfaceIsInUse(s.surf) } != 0 { return None; }
+            let mut seed = 0u32;
+            unsafe { IOSurfaceLock(s.surf, 0, &mut seed); }
+            // Held across a frame the caller decides not to submit, so the next call
+            // must not lock it a second time.
+            self.locked = true;
+        }
+        Some((s.addr as *mut u32, self.side, (self.generation << 2) | self.cur as u64))
     }
     pub fn submit(&mut self) {
         let Some(s) = self.surfaces[self.cur].as_ref() else { return };
-        let mut seed = 0u32;
-        unsafe { IOSurfaceUnlock(s.surf, 0, &mut seed); }
+        if self.locked {
+            let mut seed = 0u32;
+            unsafe { IOSurfaceUnlock(s.surf, 0, &mut seed); }
+            self.locked = false;
+        }
         let sh = &self.sh;
         let layer = sh.layer.load(Relaxed) as id;
         send1(layer, sh.sel_set_contents, s.surf as id);
@@ -152,7 +170,7 @@ impl App {
         let mut pend = sh.pend_free.lock().unwrap();
         for s in pend.drain(..) { unsafe { CFRelease(s.surf); } }
         self.core.in_flight.store(1, Relaxed);
-        self.cur ^= 1;
+        self.cur = (self.cur + 1) % BUFFERS;
     }
     pub fn poke(&self) {}
 }
@@ -497,7 +515,7 @@ pub fn open(core: Arc<Core>, title: &str, width: u32, height: u32) -> Option<(Ap
         spawn_producer(sh.clone());
         #[cfg(all(cosmo, target_arch = "aarch64"))]
         spawn_adopter();
-        let mut app_side = App { sh: sh.clone(), core: core.clone(), side: 0, generation: 0, cur: 0, surfaces: [None, None] };
+        let mut app_side = App { sh: sh.clone(), core: core.clone(), side: 0, generation: 0, cur: 0, surfaces: [None, None, None], locked: false };
         app_side.ensure_size();
         // Bind buffer 0 so the window shows something before the first flip; draw the first frame into 1.
         if let Some(s) = app_side.surfaces[0].as_ref() { send1(layer, sh.sel_set_contents, s.surf as id); }

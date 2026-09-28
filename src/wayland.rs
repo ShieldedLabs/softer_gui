@@ -162,7 +162,7 @@ impl App {
         if self.core.busy[self.cur].load(Acquire) { return None; }
         let mem = self.pool.as_ref()?;
         let off = (self.cur as u32 * self.side * self.side * 4) as usize;
-        Some((unsafe { mem.ptr.add(off) } as *mut u32, self.side, (self.generation << 1) | self.cur as u64))
+        Some((unsafe { mem.ptr.add(off) } as *mut u32, self.side, (self.generation << 2) | self.cur as u64))
     }
     pub fn submit(&mut self) {
         let sh = &self.sh;

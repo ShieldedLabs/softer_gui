@@ -172,7 +172,8 @@ pub struct Framebuffer {
     pub side: usize,
     pub width: usize,
     pub height: usize,
-    /// (generation << 1) | buffer index. Same key = same memory with what you last drew into it.
+    /// (generation << 2) | buffer index (0..=2; a backend uses up to three buffers). Same key =
+    /// same memory with what you last drew into it, so a per-buffer damage cache is keyed by it.
     pub key: u64,
 }
 impl Framebuffer {

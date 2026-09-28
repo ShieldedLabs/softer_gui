@@ -185,7 +185,7 @@ impl App {
         }
         let s = g.as_ref()?;
         // Index pinned to 0: one buffer, so the low bit of the key never moves.
-        Some((s.pixels, s.side, self.generation << 1))
+        Some((s.pixels, s.side, self.generation << 2))
     }
 
     /// Publish the finished frame and ask the pump to put it on screen.

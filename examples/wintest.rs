@@ -358,7 +358,7 @@ fn main() {
     // power-of-two boundary and must reallocate, bump the generation, and ask for
     // a full redraw. That is the path where a backend silently keeps handing out
     // the old, too-small buffer.
-    let gen_before = gui.get_framebuffer().key >> 1;
+    let gen_before = gui.get_framebuffer().key >> 2;
     let side_before = gui.get_framebuffer().side;
     unsafe {
         let mut r = softer_gui::sys_win::RECT { left: 0, top: 0, right: 1200, bottom: 900 };
@@ -373,7 +373,7 @@ fn main() {
     check("resize is reflected in window_size()", w == 1200 && h == 900);
     let fb = gui.get_framebuffer();
     check("the framebuffer grew to the next power of two", fb.side == 2048 && side_before == 1024);
-    check("crossing the boundary bumped the generation", fb.key >> 1 != gen_before);
+    check("crossing the boundary bumped the generation", fb.key >> 2 != gen_before);
     check("and the window-sized sub-rect matches the new client area", fb.width == 1200 && fb.height == 900);
 
     // ---- the modal resize loop --------------------------------------------------

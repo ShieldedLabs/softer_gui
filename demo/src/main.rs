@@ -173,7 +173,7 @@ fn app(mut gui: Gui) {
                     last_t = ev.t_fs;
                     let mut fb = gui.get_framebuffer();
                     if !fb.ok() { skipped += 1; continue; }
-                    if fb.key >> 1 != last_gen { last_gen = fb.key >> 1; println!("framebuffer generation {last_gen}: side {} window {}x{}", fb.side, fb.width, fb.height); }
+                    if fb.key >> 2 != last_gen { last_gen = fb.key >> 2; println!("framebuffer generation {last_gen}: side {} window {}x{}", fb.side, fb.width, fb.height); }
                     frames += 1;
                     let now = std::time::Instant::now();
                     ft_us = now.duration_since(ft_last).as_micros() as u64; ft_last = now;
