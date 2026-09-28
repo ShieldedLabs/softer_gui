@@ -460,6 +460,16 @@ pub fn open(core: Arc<Core>, title: &str, width: u32, height: u32) -> Option<(Ap
         send_f(layer, sel_contents_scale, scale);
         send1(layer, sel("setMagnificationFilter:"), ca_filter_nearest());
         send1(layer, sel("setMinificationFilter:"), ca_filter_nearest());
+        // The contract is "the alpha byte is ignored", as the XRGB and DIB backends
+        // do natively. Core Animation will not: it composites a BGRA IOSurface as
+        // premultiplied source-over whatever the layer's `opaque` says, so a frame
+        // whose alpha bytes are 0 comes out as the window background plus a trace
+        // of the colour (measured: an all-white UI). Premultiplied source-over is
+        // rgb + backdrop * (1 - a), so an opaque black backdrop makes it rgb
+        // exactly for every alpha, which is the contract at zero per-frame cost.
+        send_bool(layer, sel("setOpaque:"), true);
+        send_bool(win, sel("setOpaque:"), true);
+        send1(win, sel("setBackgroundColor:"), send0(cls("NSColor"), sel("blackColor")));
         send_bool(win, sel("setAcceptsMouseMovedEvents:"), true);
         trace("window built");
 
