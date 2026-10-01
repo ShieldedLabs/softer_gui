@@ -337,6 +337,10 @@ struct Pump {
     /// this crate owns: everything else belongs to DWM or the driver.
     wake_qpc: Cell<i64>,
     hop_n: Cell<u32>, hop_sum: Cell<i64>, hop_max: Cell<i64>,
+    /// The wait handle has fired and no Present has followed. On the capable path
+    /// that is a dead end: the waitable object is a semaphore only Present refills,
+    /// so it cannot fire again until a frame is submitted (see frame_request).
+    wait_spent: Cell<bool>,
     have_refresh: Cell<bool>,
     in_size_move: Cell<bool>,
     cursor_hidden: Cell<bool>,
@@ -605,6 +609,7 @@ impl Pump {
         let Ok(mut pres) = self.present.try_borrow_mut() else { return };
         match &mut *pres {
             Present::D3d(d) => {
+                self.wait_spent.set(false);
                 // A failed present means the device went away (driver update, GPU
                 // reset, hibernate). Drop to the compatible path rather than dying:
                 // it needs no device and the window keeps working.
@@ -659,6 +664,7 @@ impl Pump {
             }
             if let Some(d) = D3d::new(self.hwnd.get(), self.debug, drv) {
                 self.wait_handle.set(d.waitable);
+                self.wait_spent.set(false);     // a new swapchain's waitable starts signalled
                 *pres = Present::D3d(d);
                 self.cur_driver.set(drv);
                 if self.debug { eprintln!("softer_gui: presenter -> d3d11 {drv:?}"); }
@@ -754,6 +760,40 @@ impl Pump {
         self.last_tick_ns.set(now_ns());
         self.core.display_tick(frames);
         self.core.push_render();
+    }
+
+    /// The app asked for a RENDER (Gui::request_frame) because none is coming.
+    ///
+    /// On the capable path that is literally true whenever the app lets a RENDER
+    /// go by without submitting, which it is entitled to do when nothing changed:
+    /// the swapchain's waitable is refilled by Present, so a frame that is not
+    /// presented is the last one the waitable will ever announce. Nothing else on
+    /// this path produces a RENDER outside the modal resize loop, so without this
+    /// the window stops drawing for good while input keeps arriving.
+    ///
+    /// Only that state is served. While a present is still owed the waitable will
+    /// fire by itself, and on the compatible path the vblank thread delivers a
+    /// RENDER every refresh; answering the request there as well would tick
+    /// display time twice for one refresh.
+    ///
+    /// Returns true while the request is still owed, so run() can come back for it.
+    fn frame_request(&self) -> bool {
+        if !self.core.wants_frame.load(Relaxed) || self.core.render_pending() { return false; }
+        {
+            let Ok(mut pres) = self.present.try_borrow_mut() else { return false };
+            let Present::D3d(d) = &mut *pres else { return false };
+            if !self.wait_spent.get() { return false; }
+            // `occluded` is only re-measured by Present, and frame_tick(true) returns
+            // early on it: left set, a window that was hidden when the chain went
+            // quiet would never draw again after being uncovered.
+            d.occluded = false;
+        }
+        // Gated: display time advances by the refreshes DWM counted since the last
+        // tick, and not at all if the request lands inside the same refresh, which
+        // is where an app that asks straight after skipping always lands.
+        self.frame_tick(true);
+        // push_render clears the flag, so still set means the gate held it back.
+        self.core.wants_frame.load(Relaxed)
     }
 
     // ---- window procedure --------------------------------------------------------
@@ -941,13 +981,19 @@ impl Pump {
             self.apply_cursor();
             self.apply_fullscreen();
             self.apply_icon();
+            let frame_owed = self.frame_request();
             // NOT self.blit() here. Outside the modal loop the app thread does its
             // own blit, and touching this window through GDI from the pump while it
             // is NOT processing a message deadlocks against another thread calling
             // SetWindowPos: that call holds the window lock and waits for us to pump,
             // while GetDC here waits for that same lock. Pump-side blitting stays
             // inside message handlers, which is exactly where the modal loop needs it.
-            let ms = self.core.repeat_tick(now_ns());
+            let mut ms = self.core.repeat_tick(now_ns());
+            // A request the gate held back is waiting for the next refresh, and the
+            // app is not obliged to ask twice: without this it would be answered only
+            // when the wait below times out, up to 100 ms late. Same figure the Linux
+            // pumps use for the same reason.
+            if frame_owed { ms = ms.min(4); }
             // The structural analog of poll() in the Linux pump. MWMO_INPUTAVAILABLE
             // is not optional: without it a message that arrives between the drain
             // above and this wait is marked already-seen and we sleep through it,
@@ -958,6 +1004,7 @@ impl Pump {
                 // The waitable fires meaning "render now and you will make the
                 // next vblank". Everything between here and Present is ours.
                 self.wake_qpc.set(qpc());
+                self.wait_spent.set(true);
                 self.frame_tick(false);
             }
         }
@@ -1100,7 +1147,7 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32,
             wait_handle: Cell::new(wait_handle),
             cur_driver: Cell::new(if use_d3d { first_driver } else { D3dDriver::Auto }),
             buttons: Cell::new(0), last_refresh: Cell::new(0), last_tick_ns: Cell::new(0),
-            wake_qpc: Cell::new(0), hop_n: Cell::new(0), hop_sum: Cell::new(0), hop_max: Cell::new(0), have_refresh: Cell::new(false),
+            wake_qpc: Cell::new(0), hop_n: Cell::new(0), hop_sum: Cell::new(0), hop_max: Cell::new(0), wait_spent: Cell::new(false), have_refresh: Cell::new(false),
             in_size_move: Cell::new(false), cursor_hidden: Cell::new(false), fs_applied: Cell::new(false),
             saved_rect: Cell::new(RECT::default()), saved_style: Cell::new(0), saved_ex: Cell::new(0),
             icon_big: Cell::new(0), icon_small: Cell::new(0),
