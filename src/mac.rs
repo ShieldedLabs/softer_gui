@@ -223,6 +223,16 @@ impl Layout {
     }
 }
 
+// A fresh AppKit mouseDown cannot be autorepeat. Its matching mouseUp may have
+// been swallowed by AppKit's nested resize loop; publish the missing release
+// before the new press so the app sees a new click instead of a held button.
+fn button(core: &Core, code: u32, down: bool) {
+    if down && matches!(code, BTN_LEFT | BTN_RIGHT | BTN_MIDDLE | BTN_SIDE | BTN_EXTRA) && core.key_down(code) {
+        core.key(code, false);
+    }
+    core.key(code, down);
+}
+
 // ---- CVDisplayLink: the vblank source AND the ring producer -------------------------------
 extern "C" fn link_callback(link: *mut core::ffi::c_void, _now: *const u8, _out: *const u8, _f: u64, _fo: *mut u64, user: *mut core::ffi::c_void) -> i32 {
     let sh: &Shared = unsafe { &*(user as *const Shared) };
@@ -264,7 +274,7 @@ fn produce(sh: &Shared, link: *mut core::ffi::c_void, ticks: u32) {
                 core.key_press_sym(code, sym, &text, now);
             }
             Raw::KeyUp(code) => core.key(code, false),
-            Raw::Button { code, down } => core.key(code, down),
+            Raw::Button { code, down } => button(core, code, down),
             Raw::Scroll { v, h } => { let mut d = Vec::new(); if v != 0 { d.push(AxisDiff { axis: AXIS_SCROLL_V, delta: v }); } if h != 0 { d.push(AxisDiff { axis: AXIS_SCROLL_H, delta: h }); } core.push_axes(&d); }
             Raw::Wheel { v, h } => { let mut d = Vec::new(); if v != 0 { d.push(AxisDiff { axis: AXIS_WHEEL_V, delta: v }); } if h != 0 { d.push(AxisDiff { axis: AXIS_WHEEL_H, delta: h }); } core.push_axes(&d); }
             Raw::Zoom(z) => core.push_axes(&[AxisDiff { axis: AXIS_ZOOM, delta: z }]),
@@ -721,3 +731,98 @@ pub fn takeover_main_thread(pump: Pump) -> bool {
 }
 #[cfg(not(target_arch = "aarch64"))]
 pub fn takeover_main_thread(_pump: Pump) -> bool { eprintln!("softer_gui: macOS backend is Apple Silicon only"); false }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn events(core: &Core) -> Vec<Event> {
+        let mut out = Vec::new();
+        let mut ev = Event::default();
+        while core.next_event(&mut ev) { out.push(ev); }
+        out
+    }
+
+    #[test]
+    fn ordinary_click_has_only_down_and_up() {
+        let core = Core::new();
+        button(&core, BTN_LEFT, true);
+        button(&core, BTN_LEFT, false);
+        let ev = events(&core);
+        assert_eq!(ev.len(), 2);
+        assert!(ev.iter().all(|e| e.kind == EVENT_BUTTONS));
+        assert!(ev[0].button(BTN_LEFT));
+        assert!(!ev[1].button(BTN_LEFT));
+    }
+
+    #[test]
+    fn missing_up_is_repaired_for_every_mouse_button() {
+        for code in [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA] {
+            let core = Core::new();
+            button(&core, code, true);
+            assert!(core.key_down(code));
+            assert_eq!(events(&core).len(), 1);
+            button(&core, code, true);
+            let ev = events(&core);
+            assert_eq!(ev.len(), 2, "button {code}");
+            assert!(ev.iter().all(|e| e.kind == EVENT_BUTTONS));
+            assert!(!ev[0].button(code), "button {code} must release first");
+            assert!(ev[1].button(code), "button {code} must press again");
+        }
+    }
+
+    #[test]
+    fn drag_axis_does_not_release_button() {
+        let core = Core::new();
+        button(&core, BTN_LEFT, true);
+        assert_eq!(events(&core).len(), 1);
+        core.push_axes(&[AxisDiff { axis: AXIS_MOUSE_X, delta: 256 }]);
+        let ev = events(&core);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].kind, EVENT_AXES);
+        assert!(core.key_down(BTN_LEFT));
+    }
+
+    #[test]
+    fn repeated_modifier_down_is_not_repaired() {
+        let core = Core::new();
+        button(&core, KEY_LEFTSHIFT, true);
+        button(&core, KEY_LEFTSHIFT, true);
+        let ev = events(&core);
+        assert_eq!(ev.len(), 2);
+        assert!(ev.iter().all(|e| e.kind == EVENT_BUTTONS && e.button(KEY_LEFTSHIFT)));
+    }
+
+    #[test]
+    fn repair_preserves_other_buttons_and_modifiers() {
+        let core = Core::new();
+        button(&core, BTN_LEFT, true);
+        button(&core, BTN_RIGHT, true);
+        button(&core, KEY_LEFTSHIFT, true);
+        assert_eq!(events(&core).len(), 3);
+        button(&core, BTN_LEFT, true);
+        let ev = events(&core);
+        assert_eq!(ev.len(), 2);
+        for e in &ev {
+            assert!(e.button(BTN_RIGHT));
+            assert!(e.button(KEY_LEFTSHIFT));
+        }
+        assert!(!ev[0].button(BTN_LEFT));
+        assert!(ev[1].button(BTN_LEFT));
+    }
+
+    #[test]
+    fn second_resize_click_recovers_after_release_snapshot() {
+        let core = Core::new();
+        button(&core, BTN_LEFT, true);
+        button(&core, BTN_LEFT, true); // first resize swallowed an up
+        button(&core, BTN_LEFT, false);
+        button(&core, BTN_LEFT, true);
+        button(&core, BTN_LEFT, true); // second resize swallowed an up
+        let ev = events(&core);
+        assert_eq!(ev.len(), 7);
+        assert!(ev.iter().all(|e| e.kind == EVENT_BUTTONS));
+        assert_eq!(ev.iter().map(|e| e.button(BTN_LEFT)).collect::<Vec<_>>(),
+                   [true, false, true, false, true, false, true]);
+    }
+}
