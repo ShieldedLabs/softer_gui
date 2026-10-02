@@ -43,6 +43,19 @@ fn nsstring(s: &str) -> id { let c = format!("{s}\0"); let f: extern "C" fn(id, 
 
 extern "C" fn yes_imp(_this: id, _sel: SEL) -> Boolean { 1 }
 
+// Close requests, counted where AppKit makes them and turned into EVENT_CLOSE by
+// the pump. The red button reaches windowShouldClose: on the window itself (there
+// is no delegate); Quit from the Dock, a logout or a shutdown reaches
+// applicationShouldTerminate:. Both answer "not now": the app decides, as WM_CLOSE
+// lets it on Windows, and it leaves by exiting -- not through AppKit's exit(),
+// which would skip whatever the app does on the way out. Not polled from window
+// state, because a minimized window, a hidden app, another Space and a closed
+// window are all just "not visible" there. The imps are a single atomic so they
+// are safe however they are called, including on the main thread of an APE.
+static CLOSE_ASKS: AtomicU32 = AtomicU32::new(0);
+extern "C" fn should_close_imp(_this: id, _sel: SEL, _sender: id) -> Boolean { CLOSE_ASKS.fetch_add(1, Relaxed); 0 }
+extern "C" fn should_terminate_imp(_this: id, _sel: SEL, _app: id) -> u64 { CLOSE_ASKS.fetch_add(1, Relaxed); 0 }   // NSTerminateCancel
+
 /// SOFTER_GUI_DEBUG=1 traces the macOS open sequence. Worth having: in an APE
 /// every one of these steps is a dlopen'd call that can fail differently from
 /// the native build.
@@ -335,12 +348,11 @@ pub struct Pump {
     app: id, win: id, layer: id,
     layout: Layout,
     sel_next_event: SEL, sel_send_event: SEL, sel_type: SEL, sel_keycode: SEL, sel_is_repeat: SEL, sel_modifier_flags: SEL,
-    sel_is_visible: SEL, sel_is_key_window: SEL, sel_screen: SEL, sel_device_desc: SEL, sel_object_for_key: SEL, sel_unsigned_int: SEL,
-    sel_windows: SEL, sel_contains_object: SEL,
+    sel_is_key_window: SEL, sel_screen: SEL, sel_device_desc: SEL, sel_object_for_key: SEL, sel_unsigned_int: SEL,
     sel_scroll_x: SEL, sel_scroll_y: SEL, sel_precise: SEL, sel_magnification: SEL, sel_rotation: SEL, sel_button_number: SEL,
     date_distant_past: id, run_loop_mode: id, screen_number_key: id,
     cls_nscursor: Class, sel_hide: SEL, sel_unhide: SEL, sel_toggle_fs: SEL,
-    cursor_applied: bool, fs_applied: bool, focused: bool, close_sent: bool, display: u32, nsmods: u64,
+    cursor_applied: bool, fs_applied: bool, focused: bool, display: u32, nsmods: u64,
 }
 
 impl Pump {
@@ -440,16 +452,9 @@ impl Pump {
         if fs != self.fs_applied { self.fs_applied = fs; send1(self.win, self.sel_toggle_fs, core::ptr::null_mut()); }
         let focused = ret_u64(self.win, self.sel_is_key_window) & 1 != 0;
         if focused != self.focused { self.focused = focused; self.push(Raw::Focus(focused)); }
-        // Closed, not merely off screen: a miniaturized window (and every
-        // window of a hidden application) fails isVisible but is still in the
-        // app's window list, and minimize must not read as close. A closed
-        // window leaves that list; Windows answers the same question with
-        // WM_CLOSE.
-        let wins = send0(self.app, self.sel_windows);
-        if !self.close_sent && (wins.is_null() || send1(wins, self.sel_contains_object, self.win) as u64 & 1 == 0) {
-            self.close_sent = true;
-            self.push(Raw::Close);
-        }
+        // One EVENT_CLOSE per pass that saw a request (see CLOSE_ASKS); not latched, so
+        // an app that ignored the first click gets the next one, as on Windows.
+        if CLOSE_ASKS.swap(0, Relaxed) != 0 { self.push(Raw::Close); }
         // Follow the window to another monitor: retarget the link so its cadence and period match.
         let screen = send0(self.win, self.sel_screen);
         if !screen.is_null() {
@@ -473,14 +478,25 @@ pub fn open(core: Arc<Core>, title: &str, width: u32, height: u32) -> Option<(Ap
         trace("frameworks loaded");
         let app = send0(cls("NSApplication"), sel("sharedApplication"));
         send_u(app, sel("setActivationPolicy:"), 0);
-        // An NSWindow subclass whose canBecomeKeyWindow answers YES, so a borderless (fullscreen) window keeps the keyboard.
+        // An NSWindow subclass whose canBecomeKeyWindow answers YES, so a borderless (fullscreen)
+        // window keeps the keyboard, and whose windowShouldClose: turns the red button into a
+        // request (CLOSE_ASKS). A second open() in the process finds the class already registered.
         let mut win_cls = cls("NSWindow");
         let fs_cls = objc_allocateClassPair(win_cls, b"SofterGuiWindow\0".as_ptr(), 0);
         if !fs_cls.is_null() {
             class_addMethod(fs_cls, sel("canBecomeKeyWindow"), yes_imp as *const _, b"c@:\0".as_ptr());
+            class_addMethod(fs_cls, sel("windowShouldClose:"), should_close_imp as *const _, b"c@:@\0".as_ptr());
             objc_registerClassPair(fs_cls);
             win_cls = fs_cls;
-        }
+        } else if !cls("SofterGuiWindow").is_null() { win_cls = cls("SofterGuiWindow"); }
+        // Quit from the Dock (and logout, shutdown) asks the delegate first; without one AppKit
+        // calls exit() on the spot. NSApp holds its delegate weakly, so this one is leaked.
+        let mut del_cls = objc_allocateClassPair(cls("NSObject"), b"SofterGuiAppDelegate\0".as_ptr(), 0);
+        if !del_cls.is_null() {
+            class_addMethod(del_cls, sel("applicationShouldTerminate:"), should_terminate_imp as *const _, b"Q@:@\0".as_ptr());
+            objc_registerClassPair(del_cls);
+        } else { del_cls = cls("SofterGuiAppDelegate"); }
+        if !del_cls.is_null() { send1(app, sel("setDelegate:"), send0(send0(del_cls, sel("alloc")), sel("init"))); }
         let win = send0(win_cls, sel("alloc"));
         let f: extern "C" fn(id, SEL, NSRect, u64, u64, bool) -> id = core::mem::transmute(msg_send_ptr());
         let win = f(win, sel("initWithContentRect:styleMask:backing:defer:"), NSRect { o: NSPoint { x: 0.0, y: 0.0 }, s: NSSize { w: width as f64, h: height as f64 } }, 15, 2, false);
@@ -589,14 +605,13 @@ pub fn open(core: Arc<Core>, title: &str, width: u32, height: u32) -> Option<(Ap
             sh, app, win, layer, layout: Layout::new(),
             sel_next_event: sel("nextEventMatchingMask:untilDate:inMode:dequeue:"), sel_send_event: sel("sendEvent:"), sel_type: sel("type"),
             sel_keycode: sel("keyCode"), sel_is_repeat: sel("isARepeat"), sel_modifier_flags: sel("modifierFlags"),
-            sel_is_visible: sel("isVisible"), sel_is_key_window: sel("isKeyWindow"), sel_screen: sel("screen"), sel_device_desc: sel("deviceDescription"),
-            sel_windows: sel("windows"), sel_contains_object: sel("containsObject:"),
+            sel_is_key_window: sel("isKeyWindow"), sel_screen: sel("screen"), sel_device_desc: sel("deviceDescription"),
             sel_object_for_key: sel("objectForKey:"), sel_unsigned_int: sel("unsignedIntValue"),
             sel_scroll_x: sel("scrollingDeltaX"), sel_scroll_y: sel("scrollingDeltaY"), sel_precise: sel("hasPreciseScrollingDeltas"),
             sel_magnification: sel("magnification"), sel_rotation: sel("rotation"), sel_button_number: sel("buttonNumber"),
             date_distant_past: send0(cls("NSDate"), sel("distantPast")), run_loop_mode: nsstring("kCFRunLoopDefaultMode"), screen_number_key: nsstring("NSScreenNumber"),
             cls_nscursor: cls("NSCursor"), sel_hide: sel("hide"), sel_unhide: sel("unhide"), sel_toggle_fs: sel("toggleFullScreen:"),
-            cursor_applied: false, fs_applied: false, focused: true, close_sent: false, display: 0, nsmods: 0,
+            cursor_applied: false, fs_applied: false, focused: true, display: 0, nsmods: 0,
         };
         trace("pump built");
         Some((app_side, pump))
