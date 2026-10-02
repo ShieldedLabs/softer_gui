@@ -336,6 +336,7 @@ pub struct Pump {
     layout: Layout,
     sel_next_event: SEL, sel_send_event: SEL, sel_type: SEL, sel_keycode: SEL, sel_is_repeat: SEL, sel_modifier_flags: SEL,
     sel_is_visible: SEL, sel_is_key_window: SEL, sel_screen: SEL, sel_device_desc: SEL, sel_object_for_key: SEL, sel_unsigned_int: SEL,
+    sel_windows: SEL, sel_contains_object: SEL,
     sel_scroll_x: SEL, sel_scroll_y: SEL, sel_precise: SEL, sel_magnification: SEL, sel_rotation: SEL, sel_button_number: SEL,
     date_distant_past: id, run_loop_mode: id, screen_number_key: id,
     cls_nscursor: Class, sel_hide: SEL, sel_unhide: SEL, sel_toggle_fs: SEL,
@@ -439,7 +440,16 @@ impl Pump {
         if fs != self.fs_applied { self.fs_applied = fs; send1(self.win, self.sel_toggle_fs, core::ptr::null_mut()); }
         let focused = ret_u64(self.win, self.sel_is_key_window) & 1 != 0;
         if focused != self.focused { self.focused = focused; self.push(Raw::Focus(focused)); }
-        if !self.close_sent && ret_u64(self.win, self.sel_is_visible) & 1 == 0 { self.close_sent = true; self.push(Raw::Close); }
+        // Closed, not merely off screen: a miniaturized window (and every
+        // window of a hidden application) fails isVisible but is still in the
+        // app's window list, and minimize must not read as close. A closed
+        // window leaves that list; Windows answers the same question with
+        // WM_CLOSE.
+        let wins = send0(self.app, self.sel_windows);
+        if !self.close_sent && (wins.is_null() || send1(wins, self.sel_contains_object, self.win) as u64 & 1 == 0) {
+            self.close_sent = true;
+            self.push(Raw::Close);
+        }
         // Follow the window to another monitor: retarget the link so its cadence and period match.
         let screen = send0(self.win, self.sel_screen);
         if !screen.is_null() {
@@ -580,6 +590,7 @@ pub fn open(core: Arc<Core>, title: &str, width: u32, height: u32) -> Option<(Ap
             sel_next_event: sel("nextEventMatchingMask:untilDate:inMode:dequeue:"), sel_send_event: sel("sendEvent:"), sel_type: sel("type"),
             sel_keycode: sel("keyCode"), sel_is_repeat: sel("isARepeat"), sel_modifier_flags: sel("modifierFlags"),
             sel_is_visible: sel("isVisible"), sel_is_key_window: sel("isKeyWindow"), sel_screen: sel("screen"), sel_device_desc: sel("deviceDescription"),
+            sel_windows: sel("windows"), sel_contains_object: sel("containsObject:"),
             sel_object_for_key: sel("objectForKey:"), sel_unsigned_int: sel("unsignedIntValue"),
             sel_scroll_x: sel("scrollingDeltaX"), sel_scroll_y: sel("scrollingDeltaY"), sel_precise: sel("hasPreciseScrollingDeltas"),
             sel_magnification: sel("magnification"), sel_rotation: sel("rotation"), sel_button_number: sel("buttonNumber"),
