@@ -175,6 +175,9 @@ pub const WS_EX_APPWINDOW: u32 = 0x0004_0000;
 pub const SW_SHOW: i32 = 5;
 pub const SW_HIDE: i32 = 0;
 
+pub const CF_UNICODETEXT: u32 = 13;
+pub const GMEM_MOVEABLE: u32 = 0x0002;
+
 pub const SWP_NOSIZE: u32 = 0x0001;
 pub const SWP_NOMOVE: u32 = 0x0002;
 pub const SWP_NOZORDER: u32 = 0x0004;
@@ -377,6 +380,11 @@ win32! {
     fn CloseHandle(h: HANDLE) -> BOOL;
     fn Sleep(ms: u32);
     fn GetLastError() -> u32;
+    fn GlobalAlloc(flags: u32, bytes: usize) -> HANDLE;
+    fn GlobalLock(h: HANDLE) -> *mut c_void;
+    fn GlobalUnlock(h: HANDLE) -> BOOL;
+    fn GlobalSize(h: HANDLE) -> usize;
+    fn GlobalFree(h: HANDLE) -> HANDLE;
     }
     "user32" => {
     fn RegisterClassExW(c: *const WNDCLASSEXW) -> u16;
@@ -425,6 +433,11 @@ win32! {
     fn PostQuitMessage(code: i32);
     fn SetTimer(h: HWND, id: usize, ms: u32, proc_: *const c_void) -> usize;
     fn KillTimer(h: HWND, id: usize) -> BOOL;
+    fn OpenClipboard(h: HWND) -> BOOL;
+    fn CloseClipboard() -> BOOL;
+    fn EmptyClipboard() -> BOOL;
+    fn GetClipboardData(format: u32) -> HANDLE;
+    fn SetClipboardData(format: u32, h: HANDLE) -> HANDLE;
     #[cfg(target_pointer_width = "64")]
     fn GetWindowLongPtrW(h: HWND, index: i32) -> isize;
     #[cfg(target_pointer_width = "64")]

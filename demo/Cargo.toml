@@ -14,7 +14,7 @@
 name = "softer_gui_demo"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.90"
 publish = false
 
 [[bin]]

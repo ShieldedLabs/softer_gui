@@ -78,13 +78,14 @@ loop {
   Wayland, an XITouchClass or touchpad-ish device name on X11, and the input
   message source (or a non-whole click delta before Windows 8) on Windows.
 * **Clipboard.** `gui.clipboard()` hands out a cloneable handle with `get()` and
-  `set(text)`, callable from any thread. Linux only so far, and nothing has to be
-  installed: X11 speaks the CLIPBOARD selection (TARGETS, UTF8_STRING, INCR on
-  the way in), Wayland speaks wl_data_device, both on the window's own
-  connection. On macOS and Windows `available()` is false. Wayland shows a
-  client the clipboard only while its window has keyboard focus, and accepts a
-  `set` only after a key or button press in it. The copied text lives in this
-  process: after exit only a clipboard manager still has it.
+  `set(text)`, callable from any thread. Nothing has to be installed: X11 speaks
+  the CLIPBOARD selection (TARGETS, UTF8_STRING, INCR on the way in), Wayland
+  speaks wl_data_device, both on the window's own connection; Windows is the
+  Win32 clipboard as CF_UNICODETEXT; macOS runs pbpaste and pbcopy, which ship
+  with the system. Wayland shows a client the clipboard only while its window
+  has keyboard focus, and accepts a `set` only after a key or button press in
+  it. On Linux the copied text lives in this process: after exit only a
+  clipboard manager still has it.
 
 ## Threads
 

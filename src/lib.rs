@@ -167,12 +167,15 @@ pub struct Gui {
 /// The system clipboard as plain text. Take one from `Gui::clipboard`, clone it
 /// freely and call it from any thread; it does not borrow the `Gui`.
 ///
-/// Linux only so far: it speaks the X11 CLIPBOARD selection and Wayland's
-/// wl_data_device on the window's own connection, so nothing has to be
-/// installed. On macOS and Windows `available` is false and the calls do nothing.
+/// On Linux it speaks the X11 CLIPBOARD selection and Wayland's wl_data_device
+/// on the window's own connection, so nothing has to be installed; on Windows
+/// it is the Win32 clipboard as CF_UNICODETEXT; on macOS it runs pbpaste and
+/// pbcopy, which ship with the system. `available` is false only for a handle
+/// that came from `Default` rather than from a window.
 ///
-/// What is copied lives in this process, as it does for every X11 and Wayland
-/// program: once the window is gone, only a clipboard manager still has it.
+/// On Linux what is copied lives in this process, as it does for every X11 and
+/// Wayland program: once the window is gone, only a clipboard manager still has
+/// it. Windows and macOS keep it.
 #[derive(Clone, Default)]
 pub struct Clipboard { back: ClipBack }
 
@@ -184,6 +187,10 @@ enum ClipBack {
     X11(Arc<x11::Shared>),
     #[cfg(target_os = "linux")]
     Wayland(Arc<wayland::Shared>),
+    #[cfg(any(target_os = "macos", cosmo))]
+    Mac,
+    #[cfg(any(target_os = "windows", cosmo))]
+    Win,
 }
 
 impl Clipboard {
@@ -197,6 +204,10 @@ impl Clipboard {
             ClipBack::X11(s) => s.clipboard_get(),
             #[cfg(target_os = "linux")]
             ClipBack::Wayland(s) => s.clipboard_get(),
+            #[cfg(any(target_os = "macos", cosmo))]
+            ClipBack::Mac => mac::clipboard_get(),
+            #[cfg(any(target_os = "windows", cosmo))]
+            ClipBack::Win => win::clipboard_get(),
             ClipBack::None => None,
         }
     }
@@ -208,6 +219,10 @@ impl Clipboard {
             ClipBack::X11(s) => s.clipboard_set(text),
             #[cfg(target_os = "linux")]
             ClipBack::Wayland(s) => s.clipboard_set(text),
+            #[cfg(any(target_os = "macos", cosmo))]
+            ClipBack::Mac => mac::clipboard_set(text),
+            #[cfg(any(target_os = "windows", cosmo))]
+            ClipBack::Win => win::clipboard_set(text),
             ClipBack::None => { let _ = text; false }
         }
     }
@@ -221,6 +236,10 @@ impl std::fmt::Debug for Clipboard {
             ClipBack::X11(_) => "Clipboard(x11)",
             #[cfg(target_os = "linux")]
             ClipBack::Wayland(_) => "Clipboard(wayland)",
+            #[cfg(any(target_os = "macos", cosmo))]
+            ClipBack::Mac => "Clipboard(mac)",
+            #[cfg(any(target_os = "windows", cosmo))]
+            ClipBack::Win => "Clipboard(win32)",
         })
     }
 }
@@ -367,8 +386,10 @@ impl Gui {
             Backend::X11(a) => ClipBack::X11(a.shared()),
             #[cfg(target_os = "linux")]
             Backend::Wayland(a) => ClipBack::Wayland(a.shared()),
-            #[allow(unreachable_patterns)]
-            _ => ClipBack::None,
+            #[cfg(any(target_os = "macos", cosmo))]
+            Backend::Mac(_) => ClipBack::Mac,
+            #[cfg(any(target_os = "windows", cosmo))]
+            Backend::Win(_) => ClipBack::Win,
         } }
     }
 

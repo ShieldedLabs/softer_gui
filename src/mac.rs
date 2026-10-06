@@ -603,6 +603,24 @@ pub fn open(core: Arc<Core>, title: &str, width: u32, height: u32) -> Option<(Ap
     }
 }
 
+// ---- clipboard -----------------------------------------------------------------------
+// By way of pbpaste and pbcopy, which ship with macOS, rather than NSPasteboard.
+pub fn clipboard_get() -> Option<String> {
+    let out = std::process::Command::new("pbpaste").output().ok()?;
+    if !out.status.success() { return None; }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+pub fn clipboard_set(text: &str) -> bool {
+    use std::io::Write;
+    let Ok(mut child) = std::process::Command::new("pbcopy").stdin(std::process::Stdio::piped()).spawn() else { return false };
+    let wrote = match child.stdin.take() {
+        Some(mut stdin) => stdin.write_all(text.as_bytes()).is_ok(),
+        None => false,
+    };
+    matches!(child.wait(), Ok(status) if wrote && status.success())
+}
+
 // ---- owning the main thread ------------------------------------------------------------
 // AppKit must be pumped on the main thread, and the app wants a plain polling API on
 // whatever thread called open(). So open() on the main thread does a register/stack
@@ -621,6 +639,17 @@ pub fn open(core: Arc<Core>, title: &str, width: u32, height: u32) -> Option<(Ap
 // thread would give two threads one thread-state pointer. That is a hang, not a
 // crash: the app thread disappears and AppKit is never pumped. Native builds
 // save and restore it as the AAPCS callee-saved register it is.
+//
+// The two variants are macros because rustc 1.90 rejects #[cfg] on a line of an
+// asm template.
+#[cfg(all(target_arch = "aarch64", not(cosmo)))]
+macro_rules! save_x27_x28 { () => { "stp x27, x28, [x0, #64]" } }
+#[cfg(all(target_arch = "aarch64", cosmo))]
+macro_rules! save_x27_x28 { () => { "str x27, [x0, #64]" } }
+#[cfg(all(target_arch = "aarch64", not(cosmo)))]
+macro_rules! load_x27_x28 { () => { "ldp x27, x28, [x0, #64]" } }
+#[cfg(all(target_arch = "aarch64", cosmo))]
+macro_rules! load_x27_x28 { () => { "ldr x27, [x0, #64]" } }
 #[cfg(target_arch = "aarch64")]
 #[unsafe(naked)]
 unsafe extern "C" fn handoff(ctx: *mut u64, flag: *const u32, new_sp: u64, pump: extern "C" fn(*mut core::ffi::c_void) -> !, arg: *mut core::ffi::c_void) -> u64 {
@@ -629,10 +658,7 @@ unsafe extern "C" fn handoff(ctx: *mut u64, flag: *const u32, new_sp: u64, pump:
         "stp x21, x22, [x0, #16]",
         "stp x23, x24, [x0, #32]",
         "stp x25, x26, [x0, #48]",
-        #[cfg(not(cosmo))]
-        "stp x27, x28, [x0, #64]",
-        #[cfg(cosmo)]
-        "str x27, [x0, #64]",
+        save_x27_x28!(),
         "stp x29, x30, [x0, #80]",
         "mov x9, sp",
         "str x9, [x0, #96]",
@@ -655,10 +681,7 @@ unsafe extern "C" fn resume(ctx: *const u64) -> ! {
         "ldp x21, x22, [x0, #16]",
         "ldp x23, x24, [x0, #32]",
         "ldp x25, x26, [x0, #48]",
-        #[cfg(not(cosmo))]
-        "ldp x27, x28, [x0, #64]",
-        #[cfg(cosmo)]
-        "ldr x27, [x0, #64]",
+        load_x27_x28!(),
         "ldp x29, x30, [x0, #80]",
         "ldr x9, [x0, #96]",
         "mov sp, x9",

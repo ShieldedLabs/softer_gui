@@ -1036,6 +1036,62 @@ unsafe fn wndproc_impl(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     unsafe { (*p).message(h, msg, w, l) }
 }
 
+// ---- clipboard -------------------------------------------------------------------
+// The one exception to "every Win32 call happens on the pump thread": the
+// clipboard is opened with no owner window, so these touch no HWND and run on
+// whichever thread calls them.
+
+/// Another process, often a clipboard manager reacting to the last change, can
+/// hold the clipboard open for a moment.
+fn clipboard_open() -> bool {
+    for _ in 0..10 {
+        if unsafe { OpenClipboard(NULL) } != 0 { return true; }
+        unsafe { Sleep(2) };
+    }
+    false
+}
+
+pub fn clipboard_get() -> Option<String> {
+    if !clipboard_open() { return None; }
+    let mut text = None;
+    unsafe {
+        let h = GetClipboardData(CF_UNICODETEXT);
+        if !h.is_null() {
+            let p = GlobalLock(h) as *const u16;
+            if !p.is_null() {
+                let units = core::slice::from_raw_parts(p, GlobalSize(h) / 2);
+                let n = units.iter().position(|&c| c == 0).unwrap_or(units.len());
+                text = Some(String::from_utf16_lossy(&units[..n]));
+                GlobalUnlock(h);
+            }
+        }
+        CloseClipboard();
+    }
+    text
+}
+
+pub fn clipboard_set(text: &str) -> bool {
+    let units = wide(text);
+    if !clipboard_open() { return false; }
+    let mut ok = false;
+    unsafe {
+        EmptyClipboard();
+        let h = GlobalAlloc(GMEM_MOVEABLE, units.len() * 2);
+        if !h.is_null() {
+            let p = GlobalLock(h) as *mut u16;
+            if !p.is_null() {
+                core::ptr::copy_nonoverlapping(units.as_ptr(), p, units.len());
+                GlobalUnlock(h);
+                ok = !SetClipboardData(CF_UNICODETEXT, h).is_null();
+            }
+            // The system takes ownership of the memory only when SetClipboardData succeeds.
+            if !ok { GlobalFree(h); }
+        }
+        CloseClipboard();
+    }
+    ok
+}
+
 // ---- open ------------------------------------------------------------------------
 pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32, opts: Options) -> Option<App> {
     let _ = app_id;                 // Windows has no WM_CLASS analog worth setting here

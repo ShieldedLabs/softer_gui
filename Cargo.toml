@@ -2,7 +2,7 @@
 name = "softer_gui"
 version = "5.0.0"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.90"
 license = "MIT"
 description = "CPU-rendered windowing with vblank-exact frame pacing and one ordered input+render event stream. Speaks X11, Wayland, AppKit and Win32 directly; no dependencies."
 repository = "https://github.com/ShieldedLabs/softer_gui"
