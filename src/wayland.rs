@@ -10,7 +10,7 @@
 //! in SCM_RIGHTS. Not run on this machine (no compositor) — written from the
 //! protocol XML and the brevis backend's proven handshake order.
 
-use std::sync::atomic::{AtomicU32, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::*};
 use std::sync::{Arc, Mutex};
 use crate::event::*;
 use crate::shm::{next_pow2, ShmMem};
@@ -99,6 +99,72 @@ pub struct Shared {
     frame_cb: AtomicU32,
     bufs: [AtomicU32; 2],
     feedbacks: Mutex<Vec<u32>>,
+    data_device: AtomicU32,
+    clip: Mutex<Clip>,
+    clip_dirty: AtomicBool,
+}
+
+/// The text types a clipboard owner may name, best first. All carry the same UTF-8 here.
+const TEXT_MIMES: [&str; 5] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "TEXT", "STRING"];
+
+/// Behind one lock because the two threads meet on `offer`: the app thread asks
+/// it for data while the pump destroys it when the selection changes, and a
+/// request on a destroyed object is a fatal protocol error. Both queue their
+/// message while holding the lock, so the wire order is always ask, then destroy.
+#[derive(Default)]
+struct Clip {
+    /// What we serve while our data source is the selection.
+    text: Vec<u8>,
+    /// The current selection's wl_data_offer and the type to ask it for; 0 when
+    /// the clipboard is empty or holds no text.
+    offer: u32,
+    mime: &'static str,
+}
+
+impl Shared {
+    fn poke(&self) {
+        // A sync round-trip makes the pump's poll return so it re-reads the app's flags.
+        let cb = self.conn.new_id();
+        self.conn.send(Msg::new(1, 0).u(cb));
+        self.conn.flush();
+    }
+    /// Offer `text` as the selection. The pump makes the data source, because
+    /// set_selection needs the serial of the input event that justifies it.
+    pub fn clipboard_set(&self, text: &str) -> bool {
+        if self.data_device.load(Relaxed) == 0 { return false; }
+        self.clip.lock().unwrap().text = text.as_bytes().to_vec();
+        self.clip_dirty.store(true, Release);
+        self.poke();
+        true
+    }
+    /// Ask the selection's owner to write its text into a pipe, and read it here
+    /// on the caller's thread: the owner may be us, and then it is the pump that
+    /// must stay free to answer.
+    pub fn clipboard_get(&self) -> Option<String> {
+        let (r, w) = sys::pipe()?;
+        let asked = {
+            let c = self.clip.lock().unwrap();
+            if c.offer != 0 { self.conn.send_fd(Msg::new(c.offer, 1).s(c.mime), w); }   // receive(mime, fd)
+            c.offer != 0
+        };
+        self.conn.flush();
+        sys::close(w);
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        while asked {
+            // An owner that never writes must not hang the caller.
+            let mut pfd = [sys::PollFd { fd: r, events: sys::pollin(), revents: 0 }];
+            let n = sys::poll(&mut pfd, 1000);
+            if n == sys::EINTR { continue; }
+            if n <= 0 { break; }
+            let n = sys::read(r, &mut buf);
+            if n == sys::EINTR { continue; }
+            if n <= 0 { break; }
+            out.extend_from_slice(&buf[..n as usize]);
+        }
+        sys::close(r);
+        if asked { Some(String::from_utf8_lossy(&out).into_owned()) } else { None }
+    }
 }
 
 pub struct App {
@@ -187,12 +253,8 @@ impl App {
         self.cur ^= 1;
         sh.conn.flush();
     }
-    pub fn poke(&self) {
-        // A sync round-trip makes the pump's poll return so it re-reads the app's flags.
-        let cb = self.sh.conn.new_id();
-        self.sh.conn.send(Msg::new(1, 0).u(cb));
-        self.sh.conn.flush();
-    }
+    pub fn poke(&self) { self.sh.poke() }
+    pub fn shared(&self) -> Arc<Shared> { self.sh.clone() }
 }
 impl Drop for App {
     fn drop(&mut self) { self.destroy_wl_buffers(); if self.pool_id != 0 { self.sh.conn.send(Msg::new(self.pool_id, 1)); } self.sh.conn.flush(); }
@@ -233,6 +295,14 @@ struct Pump {
     debug: bool,
     cursor_applied: bool, fs_applied: bool,
     sync_done: Option<u32>,
+    // Clipboard: the wl_data_device_manager global and our seat's wl_data_device;
+    // the offer the compositor is still describing and the best TEXT_MIMES index
+    // it has named; our own data sources, the newest being the selection.
+    data_mgr: u32, data_device: u32,
+    offer_new: u32, offer_rank: usize,
+    clip_sources: Vec<u32>,
+    /// Serial of the latest key or button event, which set_selection must quote.
+    input_serial: u32,
 }
 
 impl Pump {
@@ -489,6 +559,15 @@ impl Pump {
         self.fs_applied = want;
         if want { self.send(Msg::new(self.toplevel, 11).u(0)); } else { self.send(Msg::new(self.toplevel, 12)); }
     }
+    fn apply_clipboard(&mut self) {
+        if !self.sh.clip_dirty.swap(false, AcqRel) || self.data_device == 0 { return; }
+        let src = self.new_id();
+        self.send(Msg::new(self.data_mgr, 0).u(src));                                // create_data_source
+        for m in TEXT_MIMES { self.send(Msg::new(src, 0).s(m)); }                    // offer
+        self.send(Msg::new(self.data_device, 1).u(src).u(self.input_serial));        // set_selection
+        // The source this replaces is destroyed when the compositor cancels it.
+        self.clip_sources.push(src);
+    }
     fn flush_axes(&mut self) {
         if !self.axis_dirty { return; }
         self.axis_dirty = false;
@@ -547,6 +626,7 @@ impl Pump {
                     "wl_shm" => { let s = bind(self, 1); self.sh.shm.store(s, Relaxed); }
                     "xdg_wm_base" => self.wm_base = bind(self, version.min(6)),
                     "wl_seat" => { self.seat_version = version.min(9); self.seat = bind(self, self.seat_version); }
+                    "wl_data_device_manager" => self.data_mgr = bind(self, version.min(3)),
                     "zxdg_decoration_manager_v1" => self.deco_mgr = bind(self, 1),
                     "wp_viewporter" => self.viewporter = bind(self, 1),
                     "wp_cursor_shape_manager_v1" => self.cursor_mgr = bind(self, 1),
@@ -669,6 +749,48 @@ impl Pump {
             }
             return;
         }
+        if id == self.data_device && self.data_device != 0 {
+            match op {
+                0 => { self.offer_new = a.u(); self.offer_rank = usize::MAX; }   // data_offer(new id); its types follow
+                1 => {   // enter(serial, surface, x, y, offer): a drag, which we never accept
+                    a.u(); a.u(); a.i(); a.i(); let o = a.u();
+                    if o != 0 { self.send(Msg::new(o, 2)); }
+                }
+                5 => {   // selection(offer)
+                    let o = a.u();
+                    let mut c = self.sh.clip.lock().unwrap();
+                    if c.offer != 0 && c.offer != o { self.send(Msg::new(c.offer, 2)); }
+                    c.offer = 0;
+                    if o != 0 && o == self.offer_new && self.offer_rank != usize::MAX { c.offer = o; c.mime = TEXT_MIMES[self.offer_rank]; }
+                    else if o != 0 { self.send(Msg::new(o, 2)); }   // nothing textual in it
+                }
+                _ => {}
+            }
+            return;
+        }
+        if id == self.offer_new && self.offer_new != 0 {
+            if op == 0 {   // offer(mime type)
+                let mime = a.s();
+                if let Some(rank) = TEXT_MIMES.iter().position(|t| *t == mime) { self.offer_rank = self.offer_rank.min(rank); }
+            }
+            return;
+        }
+        if self.clip_sources.contains(&id) {
+            match op {
+                1 => {   // send(mime type, fd)
+                    let fd = if self.fds.is_empty() { -1 } else { self.fds.remove(0) };
+                    if fd >= 0 {
+                        // On its own thread: the reader may be slow or stuck, and it may be
+                        // our own app thread, which the pump must not wait on.
+                        let text = self.sh.clip.lock().unwrap().text.clone();
+                        let _ = std::thread::Builder::new().name("softer_gui-wl-copy".into()).spawn(move || { sys::write_all(fd, &text); sys::close(fd); });
+                    }
+                }
+                2 => { self.send(Msg::new(id, 1)); self.clip_sources.retain(|s| *s != id); }   // cancelled: replaced
+                _ => {}
+            }
+            return;
+        }
         if id == self.keyboard && self.keyboard != 0 {
             match op {
                 0 => {   // keymap(format, fd, size)
@@ -687,10 +809,16 @@ impl Pump {
                         sys::close(fd);
                     }
                 }
-                1 => { self.core.focused.store(true, Relaxed); a.u(); a.u(); for k in a.array_u32() { self.core.key(k, true); } }
-                2 => { self.core.focused.store(false, Relaxed); self.core.release_all_keys(false); }   // every key is logically up
+                1 => { self.core.focused.store(true, Relaxed); self.input_serial = a.u(); a.u(); for k in a.array_u32() { self.core.key(k, true); } }
+                2 => {   // leave: every key is logically up
+                    self.core.focused.store(false, Relaxed); self.core.release_all_keys(false);
+                    // Without focus we are told nothing more about the selection, so the
+                    // offer we hold goes stale; a fresh one comes with the next enter.
+                    let mut c = self.sh.clip.lock().unwrap();
+                    if c.offer != 0 { self.send(Msg::new(c.offer, 2)); c.offer = 0; }
+                }
                 3 => {   // key(serial, time, key, state)
-                    a.u(); a.u(); let key = a.u(); let state = a.u();
+                    self.input_serial = a.u(); a.u(); let key = a.u(); let state = a.u();
                     if state == 1 {
                         let (sym, text) = self.keymap.text(key + 8, self.mods, self.group);
                         self.core.key_press_sym(key, sym, &text, now);
@@ -726,6 +854,7 @@ impl Pump {
                 }
                 3 => {   // button(serial, time, button, state)
                     self.ptr_serial = a.u(); a.u(); let button = a.u(); let state = a.u();
+                    self.input_serial = self.ptr_serial;
                     if self.ptr_surf == self.frame_surf && self.frame_surf != 0 && self.mt != 0 {
                         if button == BTN_LEFT && state == 1 { self.begin_drag(); }
                     } else {
@@ -797,6 +926,7 @@ impl Pump {
             if hidden != self.cursor_applied { self.cursor_applied = hidden; self.update_cursor(); }
             self.apply_icon();
             self.apply_fullscreen();
+            self.apply_clipboard();
             if self.core.wants_frame.load(Relaxed) {
                 if self.core.in_flight.load(Acquire) == 0 && !self.core.render_pending() && self.configured { self.core.push_render(); }
                 timeout = timeout.min(4);
@@ -828,6 +958,7 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
         surface: AtomicU32::new(0), shm: AtomicU32::new(0), presentation: AtomicU32::new(0),
         frame_cb: AtomicU32::new(0), bufs: [AtomicU32::new(0), AtomicU32::new(0)],
         feedbacks: Mutex::new(Vec::new()),
+        data_device: AtomicU32::new(0), clip: Mutex::new(Clip::default()), clip_dirty: AtomicBool::new(false),
     });
     let mut p = Pump {
         sh: sh.clone(), core: core.clone(), rbuf: vec![0; 1 << 16], rfill: 0, fds: Vec::new(), dead: false,
@@ -844,6 +975,7 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
         last_seq: 0, first_present: true,
         debug: core.debug.load(Relaxed),
         cursor_applied: false, fs_applied: false, sync_done: None,
+        data_mgr: 0, data_device: 0, offer_new: 0, offer_rank: usize::MAX, clip_sources: Vec::new(), input_serial: 0,
     };
     // wl_display.get_registry, one round-trip for the globals, a second for what binding them triggers
     // (seat capabilities, output modes).
@@ -856,6 +988,11 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
         return None;
     }
     if !p.roundtrip() { sys::close(fd); return None; }
+    if p.data_mgr != 0 && p.seat != 0 {
+        p.data_device = p.new_id();
+        p.send(Msg::new(p.data_mgr, 1).u(p.data_device).u(p.seat));   // get_data_device
+        sh.data_device.store(p.data_device, Relaxed);
+    }
 
     core.win_w.store(width, Relaxed); core.win_h.store(height, Relaxed);
     p.have_frame = p.subcompositor != 0 && p.viewporter != 0;

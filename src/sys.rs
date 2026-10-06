@@ -25,6 +25,7 @@ pub mod nr {
     pub const RECVMSG: usize = 47;
     pub const FTRUNCATE: usize = 77;
     pub const FUTEX: usize = 202;
+    pub const PIPE2: usize = 293;
     pub const CLOCK_GETTIME: usize = 228;
     pub const MEMFD_CREATE: usize = 319;
 }
@@ -45,6 +46,7 @@ pub mod nr {
     pub const RECVMSG: usize = 212;
     pub const FTRUNCATE: usize = 46;
     pub const FUTEX: usize = 98;
+    pub const PIPE2: usize = 59;
     pub const CLOCK_GETTIME: usize = 113;
     pub const MEMFD_CREATE: usize = 279;
 }
@@ -185,6 +187,12 @@ pub fn memfd_create(name: &[u8]) -> Fd {
     unsafe { syscall2(nr::MEMFD_CREATE, p.as_ptr() as usize, MFD_CLOEXEC) as Fd }
 }
 pub fn ioctl(fd: Fd, req: usize, arg: usize) -> isize { unsafe { syscall3(nr::IOCTL, fd as usize, req, arg) } }
+/// A close-on-exec pipe as (read end, write end).
+pub fn pipe() -> Option<(Fd, Fd)> {
+    let mut fds = [0i32; 2];
+    if unsafe { syscall2(nr::PIPE2, fds.as_mut_ptr() as usize, 0o2000000) } != 0 { return None; }
+    Some((fds[0], fds[1]))
+}
 
 pub fn socket_unix() -> Fd { unsafe { syscall3(nr::SOCKET, AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0) as Fd } }
 /// `path` may begin with a NUL for the abstract namespace.

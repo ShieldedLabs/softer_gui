@@ -77,6 +77,14 @@ loop {
   hasPreciseScrollingDeltas on macOS, axis_source/value120/axis_discrete on
   Wayland, an XITouchClass or touchpad-ish device name on X11, and the input
   message source (or a non-whole click delta before Windows 8) on Windows.
+* **Clipboard.** `gui.clipboard()` hands out a cloneable handle with `get()` and
+  `set(text)`, callable from any thread. Linux only so far, and nothing has to be
+  installed: X11 speaks the CLIPBOARD selection (TARGETS, UTF8_STRING, INCR on
+  the way in), Wayland speaks wl_data_device, both on the window's own
+  connection. On macOS and Windows `available()` is false. Wayland shows a
+  client the clipboard only while its window has keyboard focus, and accepts a
+  `set` only after a key or button press in it. The copied text lives in this
+  process: after exit only a clipboard manager still has it.
 
 ## Threads
 
@@ -125,6 +133,10 @@ whole of a modal resize drag. Same polling API on every platform.
   exercised on the Mac, since driving them needs a human at the keyboard.
 * Wayland: written to the protocol from the brevis reference, not yet run (no
   compositor on the development machine).
+* Clipboard: `examples/cliptest.rs` under WSLg (Weston and Xwayland) — set and
+  read back in one process, 1 MB of text, one process to another, X11 reading
+  what Wayland set, and reading a foreign owner. An INCR paste has not been
+  exercised: it needs an owner that sends one.
 
 ## One universal binary (Cosmopolitan APE)
 

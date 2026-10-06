@@ -8,7 +8,7 @@
 //! here; the app thread only writes requests (get_framebuffer/submit) through
 //! the connection's mutex-guarded writer.
 
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::*};
 use crate::event::*;
 use crate::shm::{next_pow2, ShmMem};
@@ -21,6 +21,9 @@ const CREATE_WINDOW: u8 = 1;
 const MAP_WINDOW: u8 = 8;
 const INTERN_ATOM: u8 = 16;
 const CHANGE_PROPERTY: u8 = 18;
+const GET_PROPERTY: u8 = 20;
+const SET_SELECTION_OWNER: u8 = 22;
+const CONVERT_SELECTION: u8 = 24;
 const SEND_EVENT: u8 = 25;
 const FREE_PIXMAP: u8 = 54;
 const QUERY_EXTENSION: u8 = 98;
@@ -29,6 +32,25 @@ const QUERY_EXTENSION: u8 = 98;
 struct Atoms { wm_protocols: u32, wm_delete: u32, net_wm_sync: u32, net_wm_sync_counter: u32, net_wm_state: u32, net_wm_fullscreen: u32, net_wm_name: u32, utf8_string: u32, net_wm_pid: u32, net_wm_icon: u32 }
 
 struct Ext { present: u8, shm: u8, sync: u8, xfixes: u8, randr: u8, rr_event: u8, xkb: u8, xkb_event: u8, xi: u8 }
+
+/// The CLIPBOARD selection as text. The app thread only writes requests; every
+/// answer is an event, so it arrives on the pump, which hands a paste back
+/// through `st`. We answer our own ConvertSelection like anyone else's, so there
+/// is no "do we still own it" state to keep in step with the server.
+struct Clip {
+    clipboard: u32, targets: u32, incr: u32, utf8: u32, text_plain: u32,
+    /// The property on our window that a paste is delivered into.
+    prop: u32,
+    st: Mutex<ClipState>,
+    cv: Condvar,
+}
+#[derive(Default)]
+struct ClipState {
+    /// What we serve while we own the selection.
+    text: Vec<u8>,
+    pending: bool,
+    got: Option<Vec<u8>>,
+}
 
 /// State both threads reach: the connection and the pixmap ids the pump matches idle notifies against.
 pub struct Shared {
@@ -44,6 +66,7 @@ pub struct Shared {
     sync_ack_serial: AtomicU32,
     pixmap: [AtomicU32; 2],
     present_serial: AtomicU32,
+    clip: Clip,
     debug: bool,
 }
 
@@ -91,6 +114,56 @@ fn change_property_mode(conn: &Conn, win: u32, prop: u32, ty: u32, format: u8, m
     b.extend_from_slice(&u32b((data.len() / (format as usize / 8)) as u32));
     b.extend_from_slice(data);
     conn.req(CHANGE_PROPERTY, mode, &b);
+}
+/// One Replace then Appends. A server need only accept 256 KiB per request
+/// without BIG-REQUESTS; 64 KiB chunks stay clear of that for any size. Empty
+/// data writes one empty Replace, which leaves a zero-length property.
+fn change_property_chunked(conn: &Conn, win: u32, prop: u32, ty: u32, format: u8, data: &[u8]) {
+    const CHUNK: usize = 64 * 1024;
+    let (mut off, mut mode) = (0usize, 0u8);
+    loop {
+        let end = (off + CHUNK).min(data.len());
+        change_property_mode(conn, win, prop, ty, format, mode, &data[off..end]);
+        mode = 2;
+        off = end;
+        if off >= data.len() { break; }
+    }
+}
+
+impl Shared {
+    /// Take the CLIPBOARD selection and serve `text` from it until another client takes over.
+    pub fn clipboard_set(&self, text: &str) -> bool {
+        let c = &self.clip;
+        if c.clipboard == 0 { return false; }
+        c.st.lock().unwrap().text = text.as_bytes().to_vec();
+        // Time 0 is CurrentTime: a stale timestamp would make the server ignore the request.
+        let mut b = Vec::new();
+        b.extend_from_slice(&u32b(self.win)); b.extend_from_slice(&u32b(c.clipboard)); b.extend_from_slice(&u32b(0));
+        self.conn.req(SET_SELECTION_OWNER, 0, &b);
+        self.conn.flush();
+        true
+    }
+    /// Ask the selection's owner for its text and wait for the pump to collect it.
+    pub fn clipboard_get(&self) -> Option<String> {
+        let c = &self.clip;
+        if c.clipboard == 0 { return None; }
+        let mut st = c.st.lock().unwrap();
+        st.pending = true; st.got = None;
+        let mut b = Vec::new();
+        b.extend_from_slice(&u32b(self.win)); b.extend_from_slice(&u32b(c.clipboard)); b.extend_from_slice(&u32b(c.utf8));
+        b.extend_from_slice(&u32b(c.prop)); b.extend_from_slice(&u32b(0));
+        self.conn.req(CONVERT_SELECTION, 0, &b);
+        self.conn.flush();
+        // An owner that never answers must not hang the caller.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while st.pending {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() { break; }
+            st = c.cv.wait_timeout(st, left).unwrap().0;
+        }
+        st.pending = false;
+        st.got.take().map(|b| String::from_utf8_lossy(&b).into_owned())
+    }
 }
 
 impl App {
@@ -143,6 +216,7 @@ impl App {
         self.frame_w = w; self.frame_h = h;
         Some((b.mem.ptr as *mut u32, self.side, (self.generation << 2) | self.cur as u64))
     }
+    pub fn shared(&self) -> Arc<Shared> { self.sh.clone() }
     pub fn submit(&mut self) {
         let sh = &self.sh;
         let Some(b) = self.bufs[self.cur].as_ref() else { return };
@@ -226,6 +300,8 @@ struct Pump {
     /// After acking a sync request: hold the next RENDER until the WM's configure lands
     /// (deadline in ns), so the next frame is not started at a size about to change.
     render_hold_until: u64,
+    /// A paste too big for one property arrives in pieces (INCR); they collect here.
+    clip_incr: Option<Vec<u8>>,
 }
 
 impl Pump {
@@ -345,20 +421,10 @@ impl Pump {
             data.extend_from_slice(&u32b(img.side));
             for p in &img.argb { data.extend_from_slice(&u32b(*p)); }
         }
-        // One Replace then Appends. A server need only accept 256 KiB per request
-        // without BIG-REQUESTS, and a single 256x256 image is exactly that; 64 KiB
-        // chunks stay clear of the limit for any set. An empty set writes one empty
-        // Replace, which clears the property.
+        // Chunked: a single 256x256 image is already a whole 256 KiB request. An
+        // empty set writes one empty Replace, which clears the property.
         if self.debug { eprintln!("apply_icon: {} images, {} bytes", set.len(), data.len()); }
-        const CHUNK: usize = 64 * 1024;
-        let (mut off, mut mode) = (0usize, 0u8);
-        loop {
-            let end = (off + CHUNK).min(data.len());
-            change_property_mode(&self.sh.conn, self.sh.win, self.atoms.net_wm_icon, 6, 32, mode, &data[off..end]);
-            mode = 2;
-            off = end;
-            if off >= data.len() { break; }
-        }
+        change_property_chunked(&self.sh.conn, self.sh.win, self.atoms.net_wm_icon, 6, 32, &data);
         self.sh.conn.flush();
     }
     fn apply_fullscreen(&mut self) {
@@ -375,6 +441,67 @@ impl Pump {
         b.extend_from_slice(&ev);
         self.sh.conn.req(SEND_EVENT, 0, &b);
         self.sh.conn.flush();
+    }
+
+    // ---- clipboard ----------------------------------------------------------------
+    /// Another client wants the selection we own: write it into the property it
+    /// named on its own window, then tell it so with a SelectionNotify.
+    fn selection_request(&mut self, p: &[u8]) {
+        let c = &self.sh.clip; let conn = &self.sh.conn;
+        let time = rd32(p, 4); let requestor = rd32(p, 12); let selection = rd32(p, 16); let target = rd32(p, 20);
+        // A requestor older than ICCCM 2 names no property and means the target atom.
+        let prop = match rd32(p, 24) { 0 => target, a => a };
+        let mut ok = selection == c.clipboard;
+        if !ok {
+        } else if target == c.targets {
+            let mut d = Vec::new();
+            for a in [c.targets, c.utf8, c.text_plain] { d.extend_from_slice(&u32b(a)); }
+            change_property(conn, requestor, prop, 4, 32, &d);   // ATOM
+        } else if target == c.utf8 || target == c.text_plain {
+            change_property_chunked(conn, requestor, prop, target, 8, &c.st.lock().unwrap().text);
+        } else { ok = false; }
+        // Property None is the refusal.
+        let mut b = Vec::with_capacity(40);
+        b.extend_from_slice(&u32b(requestor)); b.extend_from_slice(&u32b(0));
+        b.extend_from_slice(&[31, 0, 0, 0]);
+        b.extend_from_slice(&u32b(time)); b.extend_from_slice(&u32b(requestor)); b.extend_from_slice(&u32b(selection));
+        b.extend_from_slice(&u32b(target)); b.extend_from_slice(&u32b(if ok { prop } else { 0 }));
+        b.extend_from_slice(&[0u8; 8]);
+        conn.req(SEND_EVENT, 0, &b);
+        conn.flush();
+    }
+    /// Read our paste property and delete it. The delete is also what asks an
+    /// INCR sender for its next piece.
+    fn take_clip_prop(&mut self) -> Option<(u32, Vec<u8>)> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&u32b(self.sh.win)); b.extend_from_slice(&u32b(self.sh.clip.prop));
+        b.extend_from_slice(&u32b(0)); b.extend_from_slice(&u32b(0)); b.extend_from_slice(&u32b(0x1fff_ffff));
+        let seq = self.sh.conn.req(GET_PROPERTY, 1, &b);
+        let rep = self.round_trip(seq)?;
+        let n = rd32(&rep, 16) as usize * (rep[1] as usize / 8);
+        Some((rd32(&rep, 8), rep.get(32..32 + n)?.to_vec()))
+    }
+    fn clip_finish(&mut self, data: Option<Vec<u8>>) {
+        self.clip_incr = None;
+        let mut st = self.sh.clip.st.lock().unwrap();
+        if st.pending { st.got = data; st.pending = false; self.sh.clip.cv.notify_all(); }
+    }
+    /// The owner answered our ConvertSelection.
+    fn selection_notify(&mut self, p: &[u8]) {
+        if rd32(p, 8) != self.sh.win || rd32(p, 12) != self.sh.clip.clipboard { return; }
+        if rd32(p, 20) == 0 { self.clip_finish(None); return; }   // no owner, or no text to give
+        match self.take_clip_prop() {
+            Some((ty, _)) if ty == self.sh.clip.incr && ty != 0 => self.clip_incr = Some(Vec::new()),
+            Some((_, data)) => self.clip_finish(Some(data)),
+            None => self.clip_finish(None),
+        }
+    }
+    /// One more INCR piece landed in the property; an empty one ends the transfer.
+    fn incr_piece(&mut self) {
+        match self.take_clip_prop() {
+            Some((_, data)) if !data.is_empty() => { if let Some(acc) = &mut self.clip_incr { acc.extend_from_slice(&data); } }
+            _ => { let acc = self.clip_incr.take(); self.clip_finish(acc); }
+        }
     }
 
     // ---- event handling ------------------------------------------------------------
@@ -447,6 +574,11 @@ impl Pump {
                     self.sh.sync_size.store((w as u64) << 32 | h as u64, Release);
                 }
             }
+            28 => {   // PropertyNotify, state NewValue
+                if self.clip_incr.is_some() && rd32(p, 4) == self.sh.win && rd32(p, 8) == self.sh.clip.prop && p[16] == 0 { self.incr_piece(); }
+            }
+            30 => self.selection_request(p),
+            31 => self.selection_notify(p),
             33 => {   // ClientMessage
                 if rd32(p, 8) == self.atoms.wm_protocols {
                     let proto = rd32(p, 12);
@@ -704,7 +836,7 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
         b.extend_from_slice(&u16b(width as u16)); b.extend_from_slice(&u16b(height as u16));
         b.extend_from_slice(&u16b(0)); b.extend_from_slice(&u16b(1));   // border, class InputOutput
         b.extend_from_slice(&u32b(conn.setup.root_visual));
-        let event_mask: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 6) | (1 << 15) | (1 << 17) | (1 << 21);
+        let event_mask: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 6) | (1 << 15) | (1 << 17) | (1 << 21) | (1 << 22);
         b.extend_from_slice(&u32b(1 | (1 << 4) | (1 << 11)));   // CWBackPixmap | CWBitGravity | CWEventMask
         b.extend_from_slice(&u32b(0)); b.extend_from_slice(&u32b(1)); b.extend_from_slice(&u32b(event_mask));
         conn.req(CREATE_WINDOW, conn.setup.root_depth, &b);
@@ -720,6 +852,16 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
         utf8_string: intern_atom(&conn, &mut r, b"UTF8_STRING"),
         net_wm_pid: intern_atom(&conn, &mut r, b"_NET_WM_PID"),
         net_wm_icon: intern_atom(&conn, &mut r, b"_NET_WM_ICON"),
+    };
+    let clip = Clip {
+        clipboard: intern_atom(&conn, &mut r, b"CLIPBOARD"),
+        targets: intern_atom(&conn, &mut r, b"TARGETS"),
+        incr: intern_atom(&conn, &mut r, b"INCR"),
+        utf8: atoms.utf8_string,
+        text_plain: intern_atom(&conn, &mut r, b"text/plain;charset=utf-8"),
+        prop: intern_atom(&conn, &mut r, b"SOFTER_GUI_CLIPBOARD"),
+        st: Mutex::new(ClipState::default()),
+        cv: Condvar::new(),
     };
     change_property(&conn, win, 39, 31, 8, title.as_bytes());   // WM_NAME / STRING
     change_property(&conn, win, atoms.net_wm_name, atoms.utf8_string, 8, title.as_bytes());
@@ -780,6 +922,7 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
         conn, win, ext, sync_counter,
         sync_want: AtomicU64::new(0), sync_done: AtomicU64::new(0), sync_size: AtomicU64::new(0), sync_ack_serial: AtomicU32::new(0),
         pixmap: [AtomicU32::new(0), AtomicU32::new(0)], present_serial: AtomicU32::new(1),
+        clip,
         debug: core.debug.load(Relaxed),
     });
     let mut pump = Pump {
@@ -788,6 +931,7 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
         cursor_applied: false, fs_applied: false, scroll: Vec::new(), pinch_scale: 1 << 16, quit_seen: false,
         debug: core.debug.load(Relaxed),
         render_hold_until: 0,
+        clip_incr: None,
     };
     pump.load_keymap();
     pump.query_devices();

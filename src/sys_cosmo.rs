@@ -57,6 +57,7 @@ mod c {
     pub fn nanosleep(req: *const Timespec, rem: *mut Timespec) -> c_int;
     pub fn __errno_location() -> *mut c_int;
     pub fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+    pub fn pipe2(fds: *mut c_int, flags: c_int) -> c_int;
 
     // Load-time constants. Names are cosmo's; values are the running host's.
     pub static SOCK_CLOEXEC: c_int;
@@ -140,6 +141,12 @@ pub fn memfd(name: &[u8]) -> Fd {
     unsafe { c::memfd_create(p.as_ptr() as *const c_char, MFD_CLOEXEC as u32) }
 }
 pub fn ioctl_fd(fd: Fd, req: usize, arg: usize) -> isize { neg(unsafe { c::ioctl(fd, req as u64, arg) } as isize) }
+/// A close-on-exec pipe as (read end, write end).
+pub fn pipe() -> Option<(Fd, Fd)> {
+    let mut fds = [0i32; 2];
+    if unsafe { c::pipe2(fds.as_mut_ptr(), c::O_CLOEXEC as c_int) } != 0 { return None; }
+    Some((fds[0], fds[1]))
+}
 
 pub fn socket_unix() -> Fd { unsafe { c::socket(AF_UNIX as c_int, SOCK_STREAM as c_int | c::SOCK_CLOEXEC, 0) } }
 pub fn connect_unix(fd: Fd, path: &[u8]) -> bool {

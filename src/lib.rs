@@ -164,6 +164,67 @@ pub struct Gui {
     back: Backend,
 }
 
+/// The system clipboard as plain text. Take one from `Gui::clipboard`, clone it
+/// freely and call it from any thread; it does not borrow the `Gui`.
+///
+/// Linux only so far: it speaks the X11 CLIPBOARD selection and Wayland's
+/// wl_data_device on the window's own connection, so nothing has to be
+/// installed. On macOS and Windows `available` is false and the calls do nothing.
+///
+/// What is copied lives in this process, as it does for every X11 and Wayland
+/// program: once the window is gone, only a clipboard manager still has it.
+#[derive(Clone, Default)]
+pub struct Clipboard { back: ClipBack }
+
+#[derive(Clone, Default)]
+enum ClipBack {
+    #[default]
+    None,
+    #[cfg(target_os = "linux")]
+    X11(Arc<x11::Shared>),
+    #[cfg(target_os = "linux")]
+    Wayland(Arc<wayland::Shared>),
+}
+
+impl Clipboard {
+    pub fn available(&self) -> bool { !matches!(self.back, ClipBack::None) }
+    /// The clipboard's text; None when it is empty, holds no text, or its owner
+    /// does not answer within a second. Wayland only shows a client the
+    /// clipboard while its window has keyboard focus.
+    pub fn get(&self) -> Option<String> {
+        match &self.back {
+            #[cfg(target_os = "linux")]
+            ClipBack::X11(s) => s.clipboard_get(),
+            #[cfg(target_os = "linux")]
+            ClipBack::Wayland(s) => s.clipboard_get(),
+            ClipBack::None => None,
+        }
+    }
+    /// Put `text` on the clipboard. On Wayland this must follow a key or button
+    /// press in the window, which is what a copy always does.
+    pub fn set(&self, text: &str) -> bool {
+        match &self.back {
+            #[cfg(target_os = "linux")]
+            ClipBack::X11(s) => s.clipboard_set(text),
+            #[cfg(target_os = "linux")]
+            ClipBack::Wayland(s) => s.clipboard_set(text),
+            ClipBack::None => { let _ = text; false }
+        }
+    }
+}
+
+impl std::fmt::Debug for Clipboard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.back {
+            ClipBack::None => "Clipboard(none)",
+            #[cfg(target_os = "linux")]
+            ClipBack::X11(_) => "Clipboard(x11)",
+            #[cfg(target_os = "linux")]
+            ClipBack::Wayland(_) => "Clipboard(wayland)",
+        })
+    }
+}
+
 /// A back buffer to draw into. Pixels are 0xAARRGGBB with alpha 0xFF; stride is `side`.
 /// `pixels` is null when no buffer is free (both still held by the display server).
 #[derive(Clone, Copy, Debug)]
@@ -300,6 +361,16 @@ impl Gui {
     pub fn set_icon(&mut self, images: &[icon::IconImage]) { self.core.set_icon(icon::own_set(images)); self.poke(); }
     /// Nominal frame period, femtoseconds.
     pub fn period_fs(&self) -> u64 { self.core.period_fs() }
+    pub fn clipboard(&self) -> Clipboard {
+        Clipboard { back: match &self.back {
+            #[cfg(target_os = "linux")]
+            Backend::X11(a) => ClipBack::X11(a.shared()),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(a) => ClipBack::Wayland(a.shared()),
+            #[allow(unreachable_patterns)]
+            _ => ClipBack::None,
+        } }
+    }
 
     fn poke(&mut self) {
         match &self.back {
