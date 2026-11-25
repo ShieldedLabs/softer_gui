@@ -813,7 +813,7 @@ impl Pump {
 // ============================================================================
 // Open
 // ============================================================================
-pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32) -> Option<App> {
+pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32, maximized: bool) -> Option<App> {
     let conn = Conn::open()?;
     let mut r = Reader::new(conn.fd);
 
@@ -955,6 +955,13 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
         b.extend_from_slice(&u32b(root)); b.extend_from_slice(&u16b(1)); b.extend_from_slice(&u16b(0));
         b.extend_from_slice(&u16b(0)); b.extend_from_slice(&u16b(1)); b.extend_from_slice(&u32b((1 << 1) | (1 << 11)));
         conn.req(xi, 46, &b);
+    }
+    // Set before mapping, this is the window's initial state; the WM then sends
+    // the maximized size as an ordinary ConfigureNotify.
+    if maximized && atoms.net_wm_state != 0 {
+        let mut st = u32b(intern_atom(&conn, &mut r, b"_NET_WM_STATE_MAXIMIZED_VERT")).to_vec();
+        st.extend_from_slice(&u32b(intern_atom(&conn, &mut r, b"_NET_WM_STATE_MAXIMIZED_HORZ")));
+        change_property(&conn, win, atoms.net_wm_state, 4, 32, &st);
     }
     conn.req(MAP_WINDOW, 0, &u32b(win));
     if core.debug.load(Relaxed) { eprintln!("softer_gui: x11 window 0x{win:x}"); }

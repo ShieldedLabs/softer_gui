@@ -174,6 +174,7 @@ pub const WS_EX_APPWINDOW: u32 = 0x0004_0000;
 
 pub const SW_SHOW: i32 = 5;
 pub const SW_HIDE: i32 = 0;
+pub const SW_SHOWMAXIMIZED: i32 = 3;
 
 pub const CF_UNICODETEXT: u32 = 13;
 pub const GMEM_MOVEABLE: u32 = 0x0002;

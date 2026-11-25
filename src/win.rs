@@ -1255,7 +1255,7 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32,
         if opts.fullscreen { core2b.wants_fullscreen.store(true, Relaxed); }
         pump.refresh_repeat();
         pump.update_scale();
-        unsafe { ShowWindow(hwnd, SW_SHOW); UpdateWindow(hwnd); }
+        unsafe { ShowWindow(hwnd, if opts.maximized { SW_SHOWMAXIMIZED } else { SW_SHOW }); UpdateWindow(hwnd); }
         pump.update_size();
 
         // Always started, even when D3D is presenting and nothing is waiting on

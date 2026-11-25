@@ -58,6 +58,7 @@ fn options_from_args() -> softer_gui::Options {
         match a.as_str() {
             "--debug" => o.debug = true,
             "--fullscreen" => o.fullscreen = true,
+            "--maximized" => o.maximized = true,
             "--gdi" => o.backend = Backend_::Gdi,
             "--d3d" => o.backend = Backend_::D3d,
             "--x11" => o.backend = Backend_::X11,

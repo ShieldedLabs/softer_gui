@@ -121,6 +121,10 @@ pub struct Options {
     /// latency, because it lets the compositor hand the swapchain straight to
     /// the display controller instead of compositing it.
     pub fullscreen: bool,
+    /// Start maximized. The width and height given to `open_with` are then the
+    /// size the window takes when it is restored; the first frame's size is the
+    /// maximized one the system reports.
+    pub maximized: bool,
     pub backend: Backend_,
     pub d3d_driver: D3dDriver,
 }
@@ -133,6 +137,7 @@ impl Options {
         Options {
             debug: std::env::var("SOFTER_GUI_DEBUG").is_ok(),
             fullscreen: std::env::var("SOFTER_GUI_FULLSCREEN").is_ok(),
+            maximized: std::env::var("SOFTER_GUI_MAXIMIZED").is_ok(),
             backend: match (var("SOFTER_GUI_X11").as_str(), var("SOFTER_GUI_WIN").as_str()) {
                 ("1", _) => Backend_::X11,
                 (_, "gdi") => Backend_::Gdi,
@@ -282,7 +287,7 @@ pub fn open_with(title: &str, app_id: &str, width: u32, height: u32, opts: Optio
     #[cfg(cosmo)]
     if mac_sys::on_macos() {
         let _ = app_id;
-        return open_mac(core, title, width, height);
+        return open_mac(core, title, width, height, opts.maximized);
     }
     #[cfg(cosmo)]
     if sys_win::cosmo::is_windows() {
@@ -293,17 +298,17 @@ pub fn open_with(title: &str, app_id: &str, width: u32, height: u32, opts: Optio
     {
         let force_x11 = opts.backend == Backend_::X11;
         if !force_x11 {
-            if let Some(app) = wayland::open(core.clone(), title, app_id, width, height) {
+            if let Some(app) = wayland::open(core.clone(), title, app_id, width, height, opts.maximized) {
                 return Some(Gui { core, back: Backend::Wayland(app) });
             }
         }
-        let app = x11::open(core.clone(), title, app_id, width, height)?;
+        let app = x11::open(core.clone(), title, app_id, width, height, opts.maximized)?;
         Some(Gui { core, back: Backend::X11(app) })
     }
     #[cfg(all(target_os = "macos", not(cosmo)))]
     {
         let _ = app_id;
-        open_mac(core, title, width, height)
+        open_mac(core, title, width, height, opts.maximized)
     }
     #[cfg(all(target_os = "windows", not(cosmo)))]
     {
@@ -313,8 +318,8 @@ pub fn open_with(title: &str, app_id: &str, width: u32, height: u32, opts: Optio
 }
 
 #[cfg(any(target_os = "macos", cosmo))]
-fn open_mac(core: Arc<Core>, title: &str, width: u32, height: u32) -> Option<Gui> {
-    let (app, pump) = mac::open(core.clone(), title, width, height)?;
+fn open_mac(core: Arc<Core>, title: &str, width: u32, height: u32, maximized: bool) -> Option<Gui> {
+    let (app, pump) = mac::open(core.clone(), title, width, height, maximized)?;
     // From here on we are a different kernel thread: the main thread now belongs to AppKit.
     if !mac::takeover_main_thread(pump) { return None; }
     Some(Gui { core, back: Backend::Mac(app) })

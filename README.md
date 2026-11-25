@@ -262,8 +262,9 @@ profile here sets both to values that break threads under cosmo. Native builds
 keep the profile as written.
 
 Every program here takes the same flags: `--debug` traces what the backend chose
-and how it is pacing, `--fullscreen` starts borderless fullscreen, `--x11`,
-`--gdi` and `--d3d` pick a backend, `--warp` and `--hardware` pick a D3D11 device.
+and how it is pacing, `--fullscreen` starts borderless fullscreen, `--maximized`
+starts maximized, `--x11`, `--gdi` and `--d3d` pick a backend, `--warp` and
+`--hardware` pick a D3D11 device.
 
 They are flags rather than environment variables, which needed one thing from the
 library: it cannot read a command line. Reading the program's own argv is not a

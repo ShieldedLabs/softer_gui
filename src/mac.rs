@@ -419,7 +419,7 @@ impl Pump {
     }
 
     pub fn pump_once(&mut self) {
-        let core = &self.sh.core;
+        let core = self.sh.core.clone();
         loop {
             let f: extern "C" fn(id, SEL, u64, id, id, bool) -> id = unsafe { core::mem::transmute(msg_send_ptr()) };
             let ev = f(self.app, self.sel_next_event, u64::MAX, self.date_distant_past, self.run_loop_mode, true);
@@ -500,7 +500,7 @@ impl Pump {
 }
 
 /// Open the window (main thread only). Returns the consumer-side App and the main-thread Pump.
-pub fn open(core: Arc<Core>, title: &str, width: u32, height: u32) -> Option<(App, Pump)> {
+pub fn open(core: Arc<Core>, title: &str, width: u32, height: u32, maximized: bool) -> Option<(App, Pump)> {
     unsafe {
         // In an APE this is where AppKit, IOSurface, CoreVideo and the ObjC
         // runtime actually get loaded; natively it is a no-op returning true.
@@ -556,10 +556,15 @@ pub fn open(core: Arc<Core>, title: &str, width: u32, height: u32) -> Option<(Ap
         send_bool(win, sel("setOpaque:"), true);
         send1(win, sel("setBackgroundColor:"), send0(cls("NSColor"), sel("blackColor")));
         send_bool(win, sel("setAcceptsMouseMovedEvents:"), true);
+        // Centred before the zoom, so the frame zoom: keeps to restore to is the
+        // centred one, and both before the window is shown, so neither animates.
+        send0(win, sel("center"));
+        if maximized { send1(win, sel("zoom:"), core::ptr::null_mut()); }
         trace("window built");
 
-        core.win_w.store((width as f64 * scale) as u32, Relaxed);
-        core.win_h.store((height as f64 * scale) as u32, Relaxed);
+        let b = ret_rect(view, sel("bounds"));
+        core.win_w.store((b.s.w * scale) as u32, Relaxed);
+        core.win_h.store((b.s.h * scale) as u32, Relaxed);
         core.scale_fx.store((scale * 65536.0) as u32, Relaxed);
         {
             let delay = ret_f64(cls("NSEvent"), sel("keyRepeatDelay")); let interval = ret_f64(cls("NSEvent"), sel("keyRepeatInterval"));
@@ -589,7 +594,6 @@ pub fn open(core: Arc<Core>, title: &str, width: u32, height: u32) -> Option<(Ap
         app_side.cur = 1;
 
         send1(win, sel("makeKeyAndOrderFront:"), core::ptr::null_mut());
-        send0(win, sel("center"));
         send_bool(app, sel("activateIgnoringOtherApps:"), true);
         send0(app, sel("finishLaunching"));
         trace("app launched");

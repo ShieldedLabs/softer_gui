@@ -962,7 +962,7 @@ fn connect() -> Option<Fd> {
     Some(fd)
 }
 
-pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32) -> Option<App> {
+pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32, maximized: bool) -> Option<App> {
     let fd = connect()?;
     let sh = Arc::new(Shared {
         conn: Conn { fd, w: Mutex::new(Writer { buf: Vec::new(), fds: Vec::new(), next_id: 2 }) },
@@ -1022,6 +1022,7 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
     // our icon when xdg-toplevel-icon-v1 is absent. It must equal the desktop
     // file basename.
     p.send(Msg::new(p.toplevel, 3).s(app_id));
+    if maximized { p.send(Msg::new(p.toplevel, 9)); }   // set_maximized: the first configure carries the size
     // Ask for server-side decorations; a compositor that answers client_side (or has no
     // manager at all — Mutter) gets our bevel instead.
     if p.deco_mgr != 0 {
