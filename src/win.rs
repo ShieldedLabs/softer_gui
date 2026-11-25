@@ -25,14 +25,16 @@
 //! a QPC sleep to the next period boundary. Refresh period from DWM's rational,
 //! else EnumDisplaySettings' integer Hz.
 //!
-//! ONE CPU BUFFER, NOT TWO. Linux needs two because the compositor HOLDS the
-//! buffer until it releases it. Windows copies out of ours synchronously and
-//! hands it straight back, so there is nothing to alternate, and alternating
-//! actively hurts: the buffer you are about to draw frame N into would hold frame
-//! N-2, so an incremental renderer would leave stale rectangles flickering
-//! between two states. We keep one buffer and pin the key's index to 0.
-//! Core::busy[] and Core::in_flight are therefore unused on Windows; that is
-//! deliberate, not unimplemented.
+//! TWO CPU BUFFERS. The copy out of ours is synchronous, but it happens on the
+//! pump thread, later than submit() and with no regard for what the app is doing:
+//! a queued WM_SOFTER_BLIT, a WM_PAINT, the resize timer. With one buffer that
+//! copy lands while the app's next frame is half drawn, and a tiled renderer
+//! shows it as tiles from two frames, or tiles cleared and not yet drawn. So the
+//! app draws into the back buffer, which the pump never reads, and submit() swaps
+//! it to the front under the lock the pump copies under. The back buffer holds
+//! the frame before last, so an incremental renderer keys its damage cache by
+//! `Framebuffer::key`, as it must on every other backend anyway. Core::busy[] and
+//! Core::in_flight are unused on Windows: nothing holds a buffer past the copy.
 //!
 //! NO ZERO-COPY HANDOFF EXISTS ON WINDOWS. Not through DIB sections, not through
 //! D3D11, not through DirectComposition. DWM composites from surfaces it owns, so
@@ -90,7 +92,7 @@ const RESIZE_TIMER_MS: u32 = 8;
 
 fn now_ns() -> u64 { (qpc() as u128 * 1_000_000_000u128 / qpf() as u128) as u64 }
 
-// ---- the one CPU buffer -------------------------------------------------------
+// ---- the CPU buffers ----------------------------------------------------------
 /// A square power-of-two DIB section plus the memory DC it is selected into.
 /// BitBlt from a selected DIB is GDI's fast path; StretchDIBits would re-validate
 /// the BITMAPINFO on every call.
@@ -131,6 +133,15 @@ impl Drop for Surface {
 }
 unsafe impl Send for Surface {}
 
+/// The front buffer is on screen and the pump copies from it; the other is the
+/// app's. `gens[i]` is the generation buffer i was allocated in, so its key stays
+/// put until that buffer itself is reallocated.
+#[derive(Default)]
+struct Bufs { s: [Option<Surface>; 2], gens: [u64; 2], front: usize }
+impl Bufs {
+    fn front(&self) -> Option<&Surface> { self.s[self.front].as_ref() }
+}
+
 /// How pixels reach the screen, and how a frame boundary is learned. The two are
 /// chosen together because they are the same decision: the capable path's wait IS
 /// its swapchain, and the compatible path's wait is a thread watching the
@@ -146,10 +157,9 @@ enum Present {
 // ---- shared between the three threads ------------------------------------------
 pub struct Shared {
     hwnd: AtomicUsize,
-    /// The single CPU buffer. Locked for the blit and for reallocation; the app
-    /// draws into the pixels outside the lock, so a WM_PAINT landing mid-draw can
-    /// show a torn frame. The next submit corrects it and nothing is corrupted.
-    surf: Mutex<Option<Surface>>,
+    /// Locked for the blit, the swap and reallocation. The app draws into the back
+    /// buffer outside the lock; the pump only ever reads the front.
+    surf: Mutex<Bufs>,
     ready: Mutex<u8>,           // 0 pending, 1 open, 2 failed
     ready_cv: Condvar,
     period_fs: AtomicU64,
@@ -166,29 +176,34 @@ unsafe impl Sync for Shared {}
 pub struct App {
     sh: Arc<Shared>,
     core: Arc<Core>,
-    side: u32,
     generation: u64,
+    /// A buffer was handed out since the last submit, so submit has a frame to swap in.
+    drawn: bool,
 }
 
 impl App {
-    /// Settle a pending resize, then hand out the buffer. Never returns null: there
-    /// is only one buffer and nothing else is holding it (see the module doc).
+    /// Settle a pending resize, then hand out the back buffer. Never returns null:
+    /// the pump never reads the back buffer (see the module doc).
     pub fn get_framebuffer(&mut self) -> Option<(*mut u32, u32, u64)> {
         let w = self.core.win_w.load(Relaxed);
         let h = self.core.win_h.load(Relaxed);
         let want = crate::next_pow2(w.max(h));
         let mut g = self.sh.surf.lock().ok()?;
-        if want != self.side || g.is_none() {
-            *g = Surface::new(want);
-            g.as_ref()?;
-            self.side = want;
+        let b = 1 - g.front;
+        if g.s[b].as_ref().map(|s| s.side) != Some(want) {
+            // The front keeps its old size until the swap, so the window shows the
+            // last frame rather than a blank buffer while this one is drawn.
+            g.s[b] = None;
+            g.s[b] = Surface::new(want);
+            g.s[b].as_ref()?;
             self.generation += 1;
+            g.gens[b] = self.generation;
             self.sh.generation.store(self.generation as u32, Relaxed);
             self.core.full_redraw.store(true, Relaxed);
         }
-        let s = g.as_ref()?;
-        // Index pinned to 0: one buffer, so the low bit of the key never moves.
-        Some((s.pixels, s.side, self.generation << 2))
+        let s = g.s[b].as_ref()?;
+        self.drawn = true;
+        Some((s.pixels, s.side, (g.gens[b] << 2) | b as u64))
     }
 
     /// Publish the finished frame and ask the pump to put it on screen.
@@ -210,6 +225,12 @@ impl App {
     pub fn submit(&mut self) {
         let hwnd = self.sh.hwnd.load(Relaxed) as HWND;
         if hwnd.is_null() { return; }
+        if !core::mem::take(&mut self.drawn) { return; }
+        // Blocking is fine here, unlike on the pump: the pump holds this lock only
+        // for one copy.
+        let Ok(mut g) = self.sh.surf.lock() else { return };
+        g.front = 1 - g.front;
+        drop(g);
         self.sh.dirty.store(true, Release);
         unsafe { PostMessageW(hwnd, WM_SOFTER_BLIT, 0, 0) };
     }
@@ -600,7 +621,7 @@ impl Pump {
             unsafe { PostMessageW(self.hwnd.get(), WM_SOFTER_BLIT, 0, 0) };
             return;
         };
-        let Some(s) = g.as_ref() else { return };
+        let Some(s) = g.front() else { return };
         self.sh.dirty.store(false, Release);
         let wake = self.wake_qpc.get();
         if wake != 0 {
@@ -820,7 +841,7 @@ impl Pump {
                 // repaint rather than stalling the message loop. Nothing is lost;
                 // the app submits again and WM_SOFTER_BLIT puts it up.
                 if let Ok(g) = self.sh.surf.try_lock() {
-                    if let Some(s) = g.as_ref() {
+                    if let Some(s) = g.front() {
                         unsafe { BitBlt(ps.hdc, 0, 0, cw.min(s.side as i32), ch.min(s.side as i32), s.memdc, 0, 0, SRCCOPY); }
                     }
                 }
@@ -1123,7 +1144,7 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32,
 
     let sh = Arc::new(Shared {
         hwnd: AtomicUsize::new(0),
-        surf: Mutex::new(None),
+        surf: Mutex::new(Bufs::default()),
         ready: Mutex::new(0),
         ready_cv: Condvar::new(),
         period_fs: AtomicU64::new(period),
@@ -1264,5 +1285,5 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32,
     if *g != 1 { return None; }
     drop(g);
 
-    Some(App { sh, core, side: 0, generation: 0 })
+    Some(App { sh, core, generation: 0, drawn: false })
 }

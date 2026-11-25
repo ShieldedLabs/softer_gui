@@ -45,15 +45,15 @@ loop {
   queried, never measured (RandR mode rational, wl_output/wp_presentation refresh,
   CVDisplayLink nominal, DWM `rateRefresh` rational). Equal timestamps mean
   the same frame: re-render, do not step.
-* **Framebuffer.** Two square power-of-two buffers larger than the window, stride =
-  side, 0xAARRGGBB. `key = generation<<1 | index` is stable per buffer until a
-  realloc, so a renderer can cache what it drew per key and patch the diff.
-  X11: memfd → MIT-SHM AttachFd → shared pixmap → PresentPixmap. Wayland: memfd
-  pool → wl_shm buffers. macOS: IOSurfaces bound as the layer's contents.
-  Windows is the exception and keeps ONE buffer with the index pinned to 0: every
-  Windows present path copies our pixels out synchronously, so there is nothing to
-  alternate, and alternating would leave the buffer you draw frame N into holding
-  frame N-2, which is a stale-tile trap for an incremental renderer.
+* **Framebuffer.** Two or three square power-of-two buffers larger than the window,
+  stride = side, 0xAARRGGBB. `key = generation<<2 | index` is stable per buffer
+  until that buffer is reallocated, so a renderer caches what it drew per key and
+  patches the diff against what that buffer holds, not against the last frame.
+  X11: memfd → MIT-SHM AttachFd → shared pixmap →
+  PresentPixmap. Wayland: memfd pool → wl_shm buffers. macOS: IOSurfaces bound as
+  the layer's contents. Windows: two DIB sections; the pump thread copies from the
+  front one whenever it paints, so the app draws only into the back one and
+  `submit` swaps them.
 * **Pacing.** One present per vblank, self-sustaining: the completion of one frame
   is the RENDER for the next. On X11 only a complete with a new msc drives a tick
   (a same-vblank COPY or a SKIP does not, or two presents stay in flight and the
