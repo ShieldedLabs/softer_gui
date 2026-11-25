@@ -353,6 +353,8 @@ pub struct Pump {
     date_distant_past: id, run_loop_mode: id, screen_number_key: id,
     cls_nscursor: Class, sel_hide: SEL, sel_unhide: SEL, sel_toggle_fs: SEL,
     cursor_applied: bool, fs_applied: bool, focused: bool, display: u32, nsmods: u64,
+    /// The CursorShape last set, as u8, and where the pointer was when it was.
+    shape_applied: u8, shape_at: (i64, i64),
 }
 
 impl Pump {
@@ -379,6 +381,34 @@ impl Pump {
         let obj = send1(send0(cls("NSImage"), sel("alloc")), sel("initWithData:"), data);
         if obj.is_null() { return; }
         send1(self.app, sel("setApplicationIconImage:"), obj);
+    }
+
+    /// NSCursor's `set` lasts only until AppKit or another window sets its own, and
+    /// with no cursor rects on our view nothing restores ours. So a shape other than
+    /// the arrow is set again whenever the pointer moves inside the view. Over the
+    /// view's edge the window's own resize cursor wins, since the pointer is outside.
+    fn apply_cursor_shape(&mut self) {
+        let core = &self.sh.core;
+        let shape = core.cursor_shape.load(Relaxed);
+        let at = (core.cursor_x.load(Relaxed) >> 32, core.cursor_y.load(Relaxed) >> 32);
+        let inside = at.0 >= 0 && at.1 >= 0 && at.0 < core.win_w.load(Relaxed) as i64 && at.1 < core.win_h.load(Relaxed) as i64;
+        if !inside || (shape == self.shape_applied && (shape == 0 || at == self.shape_at)) { return; }
+        self.shape_applied = shape;
+        self.shape_at = at;
+        // No public NSCursor draws a wait or a diagonal resize. The diagonals have
+        // long-lived private class methods, used only where the class answers them.
+        let name = match CursorShape::from_u8(shape) {
+            CursorShape::Arrow | CursorShape::Wait => "arrowCursor", CursorShape::Hand => "pointingHandCursor",
+            CursorShape::Text => "IBeamCursor", CursorShape::Crosshair => "crosshairCursor",
+            CursorShape::NotAllowed => "operationNotAllowedCursor", CursorShape::Move => "openHandCursor",
+            CursorShape::ResizeEw => "resizeLeftRightCursor", CursorShape::ResizeNs => "resizeUpDownCursor",
+            CursorShape::ResizeNwse => "_windowResizeNorthWestSouthEastCursor",
+            CursorShape::ResizeNesw => "_windowResizeNorthEastSouthWestCursor",
+        };
+        let mut s = sel(name);
+        if send1(self.cls_nscursor, sel("respondsToSelector:"), s) as u64 & 0xFF == 0 { s = sel("arrowCursor"); }
+        let c = send0(self.cls_nscursor, s);
+        if !c.is_null() { send0(c, sel("set")); }
     }
 
     /// Block up to `ms` for an NSEvent to become available (peek, no dequeue); pump_once then takes it.
@@ -448,6 +478,7 @@ impl Pump {
         self.apply_icon();
         let hidden = core.cursor_hidden.load(Relaxed);
         if hidden != self.cursor_applied { self.cursor_applied = hidden; send0(self.cls_nscursor, if hidden { self.sel_hide } else { self.sel_unhide }); }
+        self.apply_cursor_shape();
         let fs = core.wants_fullscreen.load(Relaxed);
         if fs != self.fs_applied { self.fs_applied = fs; send1(self.win, self.sel_toggle_fs, core::ptr::null_mut()); }
         let focused = ret_u64(self.win, self.sel_is_key_window) & 1 != 0;
@@ -612,6 +643,7 @@ pub fn open(core: Arc<Core>, title: &str, width: u32, height: u32) -> Option<(Ap
             date_distant_past: send0(cls("NSDate"), sel("distantPast")), run_loop_mode: nsstring("kCFRunLoopDefaultMode"), screen_number_key: nsstring("NSScreenNumber"),
             cls_nscursor: cls("NSCursor"), sel_hide: sel("hide"), sel_unhide: sel("unhide"), sel_toggle_fs: sel("toggleFullScreen:"),
             cursor_applied: false, fs_applied: false, focused: true, display: 0, nsmods: 0,
+            shape_applied: u8::MAX, shape_at: (0, 0),
         };
         trace("pump built");
         Some((app_side, pump))

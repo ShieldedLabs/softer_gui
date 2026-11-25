@@ -293,7 +293,7 @@ struct Pump {
     pinch_scale: i32,
     last_seq: u64, first_present: bool,
     debug: bool,
-    cursor_applied: bool, fs_applied: bool,
+    cursor_applied: bool, shape_applied: u8, fs_applied: bool,
     sync_done: Option<u32>,
     // Clipboard: the wl_data_device_manager global and our seat's wl_data_device;
     // the offer the compositor is still describing and the best TEXT_MIMES index
@@ -482,7 +482,17 @@ impl Pump {
     fn update_cursor(&mut self) {
         if self.ptr_surf == 0 { return; }
         if self.core.cursor_hidden.load(Relaxed) { self.set_cursor_shape(u32::MAX); return; }
-        if self.ptr_surf != self.frame_surf || self.frame_surf == 0 || self.mt == 0 { self.set_cursor_shape(1); return; }
+        if self.ptr_surf != self.frame_surf || self.frame_surf == 0 || self.mt == 0 {
+            // wp_cursor_shape_device_v1's shape numbers. The fallback surface only draws
+            // an arrow, so without the protocol every shape shows as one.
+            let shape = match CursorShape::from_u8(self.core.cursor_shape.load(Relaxed)) {
+                CursorShape::Arrow => 1, CursorShape::Hand => 4, CursorShape::Wait => 6, CursorShape::Crosshair => 8,
+                CursorShape::Text => 9, CursorShape::Move => 13, CursorShape::NotAllowed => 15, CursorShape::ResizeEw => 26,
+                CursorShape::ResizeNs => 27, CursorShape::ResizeNesw => 28, CursorShape::ResizeNwse => 29,
+            };
+            self.set_cursor_shape(if self.cursor_dev != 0 { shape } else { 1 });
+            return;
+        }
         let shape = match self.hit_edges(self.ptr_x, self.ptr_y) {
             5 => 21, 9 => 20, 6 => 24, 10 => 23, 1 => 19, 2 => 22, 4 => 25, 8 => 18, _ => 13,
         };
@@ -923,7 +933,8 @@ impl Pump {
             let now = sys::clock_monotonic_ns();
             let mut timeout = self.core.repeat_tick(now);
             let hidden = self.core.cursor_hidden.load(Relaxed);
-            if hidden != self.cursor_applied { self.cursor_applied = hidden; self.update_cursor(); }
+            let shape = self.core.cursor_shape.load(Relaxed);
+            if hidden != self.cursor_applied || shape != self.shape_applied { self.cursor_applied = hidden; self.shape_applied = shape; self.update_cursor(); }
             self.apply_icon();
             self.apply_fullscreen();
             self.apply_clipboard();
@@ -974,7 +985,7 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
         axis_v: 0, axis_h: 0, axis_v120: None, axis_h120: None, axis_dirty: false, axis_vd: None, axis_hd: None, axis_source: u32::MAX, pinch_scale: 1 << 16,
         last_seq: 0, first_present: true,
         debug: core.debug.load(Relaxed),
-        cursor_applied: false, fs_applied: false, sync_done: None,
+        cursor_applied: false, shape_applied: 0, fs_applied: false, sync_done: None,
         data_mgr: 0, data_device: 0, offer_new: 0, offer_rank: usize::MAX, clip_sources: Vec::new(), input_serial: 0,
     };
     // wl_display.get_registry, one round-trip for the globals, a second for what binding them triggers

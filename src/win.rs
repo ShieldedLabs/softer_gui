@@ -80,6 +80,9 @@ const FS: u64 = 1_000_000_000_000_000;
 
 /// The frame source during the modal resize loop (see WM_ENTERSIZEMOVE).
 const RESIZE_TIMER: usize = 1;
+const CURSOR_HIDDEN: u8 = u8::MAX;
+/// No cursor of ours is showing, so the next one must be set whatever it is.
+const CURSOR_UNSET: u8 = u8::MAX - 1;
 /// Windows clamps timers to about 10 ms, so this asks for "as often as you can".
 /// It is deliberately FASTER than any refresh rate: frame_tick gates itself on
 /// DWM's refresh counter, so polling too often costs a cheap call and nothing else.
@@ -318,7 +321,13 @@ struct Pump {
     core: Arc<Core>,
     hwnd: Cell<HWND>,
     dyn_: Arc<Dyn>,
-    cursor: HANDLE,
+    /// The system cursor for each CursorShape, indexed by its u8.
+    cursors: [HANDLE; CursorShape::ALL.len()],
+    /// The last WM_SETCURSOR hit-tested the client area, so a shape change may be
+    /// shown at once; over the frame, SetCursor would fight the border's own cursor.
+    in_client: Cell<bool>,
+    /// The cursor last shown: a CursorShape as u8, or CURSOR_HIDDEN.
+    cursor_applied: Cell<u8>,
     /// RefCell, not Cell: the presenter is too big to copy and needs &mut. Nothing
     /// re-enters it (no method here calls DefWindowProc), and every use try_borrows
     /// anyway so a future one cannot deadlock the message loop.
@@ -343,7 +352,6 @@ struct Pump {
     wait_spent: Cell<bool>,
     have_refresh: Cell<bool>,
     in_size_move: Cell<bool>,
-    cursor_hidden: Cell<bool>,
     fs_applied: Cell<bool>,
     saved_rect: Cell<RECT>,
     saved_style: Cell<isize>,
@@ -490,12 +498,16 @@ impl Pump {
     }
 
     // ---- outward state the app asked for ----------------------------------------
+    fn wanted_cursor(&self) -> u8 {
+        if self.core.cursor_hidden.load(Relaxed) { CURSOR_HIDDEN } else { self.core.cursor_shape.load(Relaxed).min(CursorShape::ALL.len() as u8 - 1) }
+    }
+    fn show_cursor(&self, c: u8) {
+        self.cursor_applied.set(c);
+        unsafe { SetCursor(if c == CURSOR_HIDDEN { NULL } else { self.cursors[c as usize] }); }
+    }
     fn apply_cursor(&self) {
-        let want = self.core.cursor_hidden.load(Relaxed);
-        if want != self.cursor_hidden.get() {
-            self.cursor_hidden.set(want);
-            unsafe { SetCursor(if want { NULL } else { self.cursor }); }
-        }
+        let want = self.wanted_cursor();
+        if want != self.cursor_applied.get() && self.in_client.get() { self.show_cursor(want); }
     }
 
     fn apply_fullscreen(&self) {
@@ -871,10 +883,14 @@ impl Pump {
             WM_ACTIVATEAPP => { self.core.focused.store(w != 0, Relaxed); return 0; }
             WM_SETCURSOR => {
                 // Low word of lParam is the hit-test code; 1 is HTCLIENT.
-                if (l & 0xFFFF) == 1 {
-                    unsafe { SetCursor(if self.core.cursor_hidden.load(Relaxed) { NULL } else { self.cursor }) };
+                let client = (l & 0xFFFF) == 1;
+                self.in_client.set(client);
+                if client {
+                    self.show_cursor(self.wanted_cursor());
                     return 1;
                 }
+                // DefWindowProc shows the border's cursor; forget ours so it comes back on re-entry.
+                self.cursor_applied.set(CURSOR_UNSET);
             }
             WM_KEYDOWN | WM_SYSKEYDOWN => {
                 self.key_down(w as u32, l);
@@ -1153,10 +1169,10 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32,
                                        i32::MIN, i32::MIN,            // CW_USEDEFAULT
                                        r.right - r.left, r.bottom - r.top,
                                        NULL, NULL, inst, core::ptr::null_mut());
-            if hwnd.is_null() { None } else { Some((hwnd, cursor)) }
+            if hwnd.is_null() { None } else { Some(hwnd) }
         };
 
-        let Some((hwnd, cursor)) = ok else {
+        let Some(hwnd) = ok else {
             *sh2.ready.lock().unwrap() = 2;
             sh2.ready_cv.notify_all();
             return;
@@ -1198,13 +1214,19 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32,
 
         let pump = Pump {
             sh: sh2.clone(), core: core2, hwnd: Cell::new(hwnd), dyn_: d.clone(),
-            cursor,
+            cursors: CursorShape::ALL.map(|c| unsafe { LoadCursorW(NULL, match c {
+                CursorShape::Arrow => IDC_ARROW, CursorShape::Hand => IDC_HAND, CursorShape::Text => IDC_IBEAM,
+                CursorShape::Crosshair => IDC_CROSS, CursorShape::Wait => IDC_WAIT, CursorShape::NotAllowed => IDC_NO,
+                CursorShape::Move => IDC_SIZEALL, CursorShape::ResizeEw => IDC_SIZEWE, CursorShape::ResizeNs => IDC_SIZENS,
+                CursorShape::ResizeNwse => IDC_SIZENWSE, CursorShape::ResizeNesw => IDC_SIZENESW,
+            }) }),
+            in_client: Cell::new(false), cursor_applied: Cell::new(CURSOR_UNSET),
             present: core::cell::RefCell::new(present),
             wait_handle: Cell::new(wait_handle),
             cur_driver: Cell::new(if use_d3d { first_driver } else { D3dDriver::Auto }),
             buttons: Cell::new(0), last_refresh: Cell::new(0), last_tick_ns: Cell::new(0),
             wake_qpc: Cell::new(0), hop_n: Cell::new(0), hop_sum: Cell::new(0), hop_max: Cell::new(0), wait_spent: Cell::new(false), have_refresh: Cell::new(false),
-            in_size_move: Cell::new(false), cursor_hidden: Cell::new(false), fs_applied: Cell::new(false),
+            in_size_move: Cell::new(false), fs_applied: Cell::new(false),
             saved_rect: Cell::new(RECT::default()), saved_style: Cell::new(0), saved_ex: Cell::new(0),
             icon_big: Cell::new(0), icon_small: Cell::new(0),
             debug: dbg,

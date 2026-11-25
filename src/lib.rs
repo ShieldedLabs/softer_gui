@@ -366,6 +366,11 @@ impl Gui {
     /// Ask for a RENDER even though nothing was submitted last frame (animation wake-up).
     pub fn request_frame(&mut self) { self.core.wants_frame.store(true, Relaxed); self.poke(); }
     pub fn set_cursor_hidden(&mut self, hidden: bool) { self.core.cursor_hidden.store(hidden, Relaxed); self.poke(); }
+    /// The pointer's shape while it is over the window's content. Cheap enough to call
+    /// every frame: only a change wakes the pump.
+    pub fn set_cursor(&mut self, shape: CursorShape) {
+        if self.core.cursor_shape.swap(shape as u8, Relaxed) != shape as u8 { self.poke(); }
+    }
     /// Switch to the next rendering path and keep the window. Windows has more
     /// than one (GDI, D3D11 on the hardware driver, D3D11 on WARP) and they differ
     /// in latency, so being able to change without restarting is how you compare

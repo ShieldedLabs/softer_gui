@@ -244,6 +244,16 @@ pub const ICON_SMALL: usize = 0;
 pub const ICON_BIG: usize = 1;
 
 pub const IDC_ARROW: usize = 32512;
+pub const IDC_IBEAM: usize = 32513;
+pub const IDC_WAIT: usize = 32514;
+pub const IDC_CROSS: usize = 32515;
+pub const IDC_SIZENWSE: usize = 32642;
+pub const IDC_SIZENESW: usize = 32643;
+pub const IDC_SIZEWE: usize = 32644;
+pub const IDC_SIZENS: usize = 32645;
+pub const IDC_SIZEALL: usize = 32646;
+pub const IDC_NO: usize = 32648;
+pub const IDC_HAND: usize = 32649;
 
 pub const MONITOR_DEFAULTTONEAREST: u32 = 0x0002;
 

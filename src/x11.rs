@@ -26,6 +26,9 @@ const SET_SELECTION_OWNER: u8 = 22;
 const CONVERT_SELECTION: u8 = 24;
 const SEND_EVENT: u8 = 25;
 const FREE_PIXMAP: u8 = 54;
+const CHANGE_WINDOW_ATTRIBUTES: u8 = 2;
+const OPEN_FONT: u8 = 45;
+const CREATE_GLYPH_CURSOR: u8 = 94;
 const QUERY_EXTENSION: u8 = 98;
 
 // Atoms we intern once.
@@ -292,6 +295,12 @@ struct Pump {
     win_root_x: i32, win_root_y: i32,
     crtc_rect: (i32, i32, u32, u32),
     cursor_applied: bool,
+    /// The CursorShape last given to the window, as u8.
+    shape_applied: u8,
+    /// The core "cursor" font, opened on the first shape that needs it; 0 = not yet.
+    cursor_font: u32,
+    /// One glyph cursor per CursorShape, made on first use; 0 = not yet.
+    cursors: [u32; CursorShape::ALL.len()],
     fs_applied: bool,
     scroll: Vec<ScrollDev>,
     pinch_scale: i32,
@@ -400,11 +409,50 @@ impl Pump {
 
     // ---- outward state the app sets -----------------------------------------------
     fn apply_cursor(&mut self) {
+        let shape = self.core.cursor_shape.load(Relaxed).min(CursorShape::ALL.len() as u8 - 1);
+        if shape != self.shape_applied {
+            self.shape_applied = shape;
+            // Arrow is cursor None, which shows whatever the root window has: the
+            // desktop's themed arrow, where a core glyph would look decades old.
+            let cid = if shape == 0 { 0 } else { self.glyph_cursor(shape) };
+            let mut b = Vec::with_capacity(12);
+            b.extend_from_slice(&u32b(self.sh.win)); b.extend_from_slice(&u32b(0x4000)); b.extend_from_slice(&u32b(cid));   // CWCursor
+            self.sh.conn.req(CHANGE_WINDOW_ATTRIBUTES, 0, &b);
+            self.sh.conn.flush();
+        }
         let want = self.core.cursor_hidden.load(Relaxed);
         if want == self.cursor_applied || self.sh.ext.xfixes == 0 { return; }
         self.cursor_applied = want;
         self.sh.conn.req(self.sh.ext.xfixes, if want { 29 } else { 30 }, &u32b(self.sh.win));
         self.sh.conn.flush();
+    }
+    /// The core cursor font's glyph for a shape. The wire has no themed cursors:
+    /// those are a libXcursor feature, built on the client side from theme files.
+    fn glyph_cursor(&mut self, shape: u8) -> u32 {
+        if self.cursors[shape as usize] != 0 { return self.cursors[shape as usize]; }
+        if self.cursor_font == 0 {
+            self.cursor_font = self.sh.conn.new_id();
+            let name = b"cursor";
+            let mut b = Vec::with_capacity(8 + name.len());
+            b.extend_from_slice(&u32b(self.cursor_font)); b.extend_from_slice(&(name.len() as u16).to_le_bytes()); b.extend_from_slice(&[0, 0]);
+            b.extend_from_slice(name);
+            self.sh.conn.req(OPEN_FONT, 0, &b);
+        }
+        // Glyph numbers from X11's cursorfont.h; each glyph's mask is the next one.
+        let glyph: u16 = match CursorShape::from_u8(shape) {
+            CursorShape::Arrow => 68, CursorShape::Hand => 60, CursorShape::Text => 152, CursorShape::Crosshair => 34,
+            CursorShape::Wait => 150, CursorShape::NotAllowed => 0, CursorShape::Move => 52, CursorShape::ResizeEw => 108,
+            CursorShape::ResizeNs => 116, CursorShape::ResizeNwse => 14, CursorShape::ResizeNesw => 12,
+        };
+        let cid = self.sh.conn.new_id();
+        let mut b = Vec::with_capacity(28);
+        b.extend_from_slice(&u32b(cid)); b.extend_from_slice(&u32b(self.cursor_font)); b.extend_from_slice(&u32b(self.cursor_font));
+        b.extend_from_slice(&glyph.to_le_bytes()); b.extend_from_slice(&(glyph + 1).to_le_bytes());
+        b.extend_from_slice(&[0; 6]);       // foreground black
+        b.extend_from_slice(&[0xFF; 6]);    // background white
+        self.sh.conn.req(CREATE_GLYPH_CURSOR, 0, &b);
+        self.cursors[shape as usize] = cid;
+        cid
     }
     fn apply_icon(&mut self) {
         let Some(set) = self.core.take_icon() else { return };
@@ -928,7 +976,7 @@ pub fn open(core: Arc<Core>, title: &str, app_id: &str, width: u32, height: u32)
     let mut pump = Pump {
         sh: sh.clone(), core: core.clone(), r, atoms, keymap: xkb::Keymap::default(),
         last_msc: 0, first_complete: true, win_root_x: 0, win_root_y: 0, crtc_rect: (0, 0, 0, 0),
-        cursor_applied: false, fs_applied: false, scroll: Vec::new(), pinch_scale: 1 << 16, quit_seen: false,
+        cursor_applied: false, shape_applied: 0, cursor_font: 0, cursors: [0; CursorShape::ALL.len()], fs_applied: false, scroll: Vec::new(), pinch_scale: 1 << 16, quit_seen: false,
         debug: core.debug.load(Relaxed),
         render_hold_until: 0,
         clip_incr: None,

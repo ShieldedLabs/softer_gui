@@ -10,7 +10,7 @@
 //! the same frame: re-render, do not step.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering::*};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering::*};
 use crate::keysym;
 
 #[cfg(all(target_os = "linux", not(cosmo)))]
@@ -152,6 +152,41 @@ impl Event {
     pub fn axes(&self) -> &[AxisDiff] { &self.axes[..self.axis_count as usize] }
 }
 
+/// The pointer's shape over the window's content. Each backend maps these to the
+/// system's own cursors; where a system has no match it shows the nearest one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CursorShape {
+    #[default]
+    Arrow,
+    /// A link or a button: the pointing hand.
+    Hand,
+    /// Text that can be selected or edited: the I-beam.
+    Text,
+    Crosshair,
+    Wait,
+    NotAllowed,
+    /// Drag to move in any direction.
+    Move,
+    /// Drag left and right.
+    ResizeEw,
+    /// Drag up and down.
+    ResizeNs,
+    /// Drag along the top-left to bottom-right diagonal.
+    ResizeNwse,
+    /// Drag along the top-right to bottom-left diagonal.
+    ResizeNesw,
+}
+
+impl CursorShape {
+    pub const ALL: [CursorShape; 11] = [
+        CursorShape::Arrow, CursorShape::Hand, CursorShape::Text, CursorShape::Crosshair, CursorShape::Wait,
+        CursorShape::NotAllowed, CursorShape::Move, CursorShape::ResizeEw, CursorShape::ResizeNs,
+        CursorShape::ResizeNwse, CursorShape::ResizeNesw,
+    ];
+    pub fn from_u8(v: u8) -> CursorShape { *Self::ALL.get(v as usize).unwrap_or(&CursorShape::Arrow) }
+}
+
 // ---- pump-owned keyboard / clock state -------------------------------------
 pub struct PumpState {
     pub keybits: [u64; 8],
@@ -191,6 +226,8 @@ pub struct Core {
     pub busy: [AtomicBool; 2],
     pub full_redraw: AtomicBool,
     pub cursor_hidden: AtomicBool,
+    /// A CursorShape as u8.
+    pub cursor_shape: AtomicU8,
     pub wants_fullscreen: AtomicBool,
     pub wants_frame: AtomicBool,
     pub quit: AtomicBool,
@@ -253,6 +290,7 @@ impl Core {
             busy: [AtomicBool::new(false), AtomicBool::new(false)],
             full_redraw: AtomicBool::new(true),
             cursor_hidden: AtomicBool::new(false),
+            cursor_shape: AtomicU8::new(0),
             wants_fullscreen: AtomicBool::new(false),
             wants_frame: AtomicBool::new(false),
             quit: AtomicBool::new(false),
